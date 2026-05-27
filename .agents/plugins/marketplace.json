@@ -1,0 +1,20 @@
+{
+  "name": "julirsia",
+  "interface": {
+    "displayName": "Julirsia Plugins"
+  },
+  "plugins": [
+    {
+      "name": "qwen-harness-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/qwen-harness-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

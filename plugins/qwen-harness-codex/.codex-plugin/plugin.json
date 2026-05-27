@@ -1,0 +1,34 @@
+{
+  "name": "qwen-harness-codex",
+  "version": "0.1.0+codex.20260527143033",
+  "description": "Codex-native hybrid harness with Pi/local Qwen worker transport.",
+  "author": {
+    "name": "Julirsia"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "qwen",
+    "pi",
+    "hybrid-harness",
+    "native-hooks"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Qwen Harness Codex",
+    "shortDescription": "Codex designs and verifies; Pi launches local Qwen workers.",
+    "longDescription": "Adds a Codex-native hybrid-run workflow with durable .qwen-harness state, hook-based write guards, Pi-launched local Qwen worker handoffs, package verification, correction packages, and a final proof gate.",
+    "developerName": "Julirsia",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Start a qwen-first hybrid run for this repo",
+      "Show the current qwen harness status",
+      "Create a correction package for failed evidence"
+    ]
+  }
+}

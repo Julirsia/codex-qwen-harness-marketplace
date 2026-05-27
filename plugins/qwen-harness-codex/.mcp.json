@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "qwen-harness-codex": {
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs"
+      ],
+      "cwd": "."
+    }
+  }
+}
