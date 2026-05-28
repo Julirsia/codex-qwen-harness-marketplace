@@ -38,7 +38,7 @@ State that this will use heavy hybrid mode:
 - Qwen performs scout and package implementation.
 - Codex owns requirements, design, package verification, correction packages, and final gate.
 - Evidence must include source/runtime/adversarial/reentry claims; smoke-only evidence is not enough.
-- Worker JSONL is written to disk and token usage is parsed from the stream/file rather than buffered as full stdout.
+- Worker stdout is summarized while streaming rather than retained as a raw log.
 - Worker evidence aliases such as `pass`, `passed`, `success`, and `ok` are normalized to completed.
 
 ## Commands

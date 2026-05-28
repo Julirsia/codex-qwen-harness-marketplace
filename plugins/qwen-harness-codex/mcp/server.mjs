@@ -8,7 +8,6 @@ import {
   runAutonomous,
   runFinalGate,
   spawnWorker,
-  summarizeEvaluation,
   verifyPackage
 } from "../scripts/qwen-harness-codex.mjs";
 
@@ -58,15 +57,6 @@ const tools = [
       cwd: { type: "string" },
       package: { type: "string" },
       packageId: { type: "string" }
-    })
-  },
-  {
-    name: "codex_harness_evaluation_report",
-    description: "Summarize local worker metrics, token usage, package verdicts, final gates, and model-routing observations for one or more .qwen-harness projects.",
-    inputSchema: objectSchema({
-      cwd: { type: "string" },
-      scanRoot: { type: "string" },
-      maxDepth: { type: "number" }
     })
   },
   {
@@ -126,7 +116,6 @@ const handlers = {
   codex_harness_spawn_worker: spawnWorker,
   codex_harness_model_health: checkLlamaSwapProvider,
   codex_harness_verify_package: verifyPackage,
-  codex_harness_evaluation_report: summarizeEvaluation,
   codex_harness_autonomous_run: (args) => runAutonomous({ ...args, detached: args.detached ?? true }),
   codex_harness_autonomous_job_status: autonomousJobStatus,
   codex_harness_create_correction: createCorrectionPackage,

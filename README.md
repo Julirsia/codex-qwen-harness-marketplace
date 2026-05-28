@@ -2,18 +2,12 @@
 
 Local Codex plugin marketplace for `qwen-harness-codex`.
 
-Current stable plugin version: `0.1.0+codex.20260528074840`.
+Current stable plugin version: `0.1.0+codex.20260528230856`.
 
 This marketplace intentionally publishes the MCP-compatible stable bundle with
-9 qwen harness tools. Run the verification script before pushing changes so a
-broken bundle does not become the latest install target.
-
-The plugin exposes two mode-selecting slash commands:
-
-- `/autonomous-run` — token-saving mode. Local Qwen implements, tests, repairs,
-  and writes compact evidence; Codex validates only evidence and tests.
-- `/heavy-harness` — assurance-oriented mode. Codex owns design, package
-  verification, corrections, and final gate while Qwen implements packages.
+9 qwen harness tools. Pi stdout is summarized while streaming, not stored
+as an unbounded raw log. Run the verification script before pushing changes so
+a broken bundle does not become the latest install target.
 
 ## Install
 

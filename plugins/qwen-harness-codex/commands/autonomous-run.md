@@ -19,7 +19,7 @@ Use this command when the user wants maximum Codex token savings and says things
 - `project`: target project directory. Required unless the user clearly names one.
 - `task` or `task_file`: natural-language task/spec. Required unless the current user prompt is itself the task.
 - `verification_command`: default `npm test`.
-- `min_tests`: default `1`; ask or choose a sensible threshold for benchmark work.
+- `min_tests`: default `1`; choose a sensible threshold for the requested project.
 - `model`: optional local model override.
 - `detached`: default `true` for MCP usage; prevents Codex/MCP timeout while Qwen works.
 
@@ -29,7 +29,7 @@ Use this command when the user wants maximum Codex token savings and says things
 2. Confirm there is no active `.qwen-harness/` heavy hybrid run in the same target project unless the user explicitly wants to reuse that directory.
 3. Check that `pi` is available before a live run.
 4. If `verification_command` starts with `npm`, require a local `package.json` after Qwen runs; parent-package npm walkup is failure.
-5. Do not read or summarize `.qwen-autonomous/runs/*/pi.stdout.jsonl`.
+5. Do not read raw Pi output; rely on compact evidence, job status, and verification logs.
 
 ## Plan
 
@@ -40,7 +40,7 @@ State that this will use autonomous-lite:
 - Qwen implements, tests, and repairs internally.
 - Codex validates only `evidence.json` and the verification command.
 - A watchdog stops the Pi worker once compact evidence and verification pass.
-- Pi JSONL token usage is parsed from the log file without loading the full log into Codex context.
+- Pi stdout is summarized while streaming and raw output is not retained.
 
 ## Commands
 

@@ -61,9 +61,9 @@ Use this mode when the priority is Codex token reduction and the task can be exp
 - Do not treat smoke-only output as behavioral acceptance evidence.
 - Do not accept worker self-report without source evidence, runtime evidence, adversarial probes, reentry probes where needed, and residual gap notes.
 - Do not directly edit product source/test/config during an active hybrid-run.
-- In autonomous-lite mode, do not read or summarize `.qwen-autonomous/runs/*/pi.stdout.jsonl`; use compact evidence and verification logs only.
+- In autonomous-lite mode, use compact evidence, job status, and verification logs only.
 - Prefer detached autonomous jobs and watchdog termination once compact evidence plus verification pass.
-- Parse local model token usage from Pi JSONL files; do not buffer full stdout into Codex context.
+- Use the runner's compact Pi stdout summary; do not buffer full stdout into Codex context.
 - Reject zero-test success and parent-package npm walkups.
 
 ## Commands
@@ -77,17 +77,17 @@ qwen-harness-codex create-correction --package P001 --review .qwen-harness/verif
 qwen-harness-codex final-gate
 
 qwen-harness-codex autonomous-run \
-  --project projects/p15-example \
-  --task-file benchmarks/p15-task.md \
+  --project projects/example \
+  --task-file task.md \
   --detached \
   --min-tests 20 \
   --verification-command npm test
 
 qwen-harness-codex autonomous-status \
-  --project projects/p15-example
+  --project projects/example
 
 qwen-harness-codex autonomous-validate \
-  --project projects/p15-example \
+  --project projects/example \
   --min-tests 20 \
   --verification-command npm test
 ```

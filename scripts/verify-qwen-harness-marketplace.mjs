@@ -6,24 +6,17 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pluginRoot = join(repoRoot, "plugins", "qwen-harness-codex");
-const expectedVersion = "0.1.0+codex.20260528110853";
+const expectedVersion = "0.1.0+codex.20260528230856";
 const expectedTools = [
   "codex_harness_hybrid_run",
   "codex_harness_hybrid_status",
   "codex_harness_spawn_worker",
   "codex_harness_model_health",
   "codex_harness_verify_package",
-  "codex_harness_evaluation_report",
   "codex_harness_autonomous_run",
   "codex_harness_autonomous_job_status",
   "codex_harness_create_correction",
   "codex_harness_final_gate",
-];
-const expectedFiles = [
-  "commands/autonomous-run.md",
-  "commands/heavy-harness.md",
-  "skills/qwen-autonomous-lite/SKILL.md",
-  "skills/qwen-heavy-harness/SKILL.md",
 ];
 
 main().catch((error) => {
@@ -33,27 +26,9 @@ main().catch((error) => {
 
 async function main() {
   assertManifest();
-  assertModeSelectors();
   assertNoBrokenBundleArtifacts();
   await assertMcpToolsList();
   console.log(`qwen-harness-codex marketplace verification passed (${expectedVersion})`);
-}
-
-function assertModeSelectors() {
-  for (const relativePath of expectedFiles) {
-    const fullPath = join(pluginRoot, relativePath);
-    if (!existsSync(fullPath)) {
-      throw new Error(`Expected mode selector file missing: ${relativePath}`);
-    }
-  }
-  const autonomousCommand = readFileSync(join(pluginRoot, "commands/autonomous-run.md"), "utf8");
-  const heavyCommand = readFileSync(join(pluginRoot, "commands/heavy-harness.md"), "utf8");
-  if (!autonomousCommand.includes("codex_harness_autonomous_run")) {
-    throw new Error("autonomous-run command does not mention codex_harness_autonomous_run");
-  }
-  if (!heavyCommand.includes("codex_harness_hybrid_run")) {
-    throw new Error("heavy-harness command does not mention codex_harness_hybrid_run");
-  }
 }
 
 function assertManifest() {

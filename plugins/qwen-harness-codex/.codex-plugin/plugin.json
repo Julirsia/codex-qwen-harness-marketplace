@@ -1,7 +1,7 @@
 {
   "name": "qwen-harness-codex",
-  "version": "0.1.0+codex.20260528110853",
-  "description": "Codex-native Qwen harness with detached autonomous-lite token-saving and heavy assurance modes.",
+  "version": "0.1.0+codex.20260528230856",
+  "description": "Codex-native Qwen harness with detached autonomous-lite, heavy assurance modes, and bounded Pi stream summaries.",
   "author": {
     "name": "Julirsia"
   },

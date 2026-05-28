@@ -30,7 +30,7 @@ Heavy harness is the assurance-oriented mode.
 8. Codex runs final gate.
 
 Codex must not directly mutate product source/test/config during an active `.qwen-harness` run.
-The runner writes Pi JSONL to disk, parses token usage from the file, and normalizes compact worker evidence aliases. If `acceptanceEvidence` is missing, raw source/runtime/adversarial/reentry fields can be converted into acceptance claims, but source plus runtime proof are still required.
+The runner summarizes Pi stdout while streaming and normalizes compact worker evidence aliases. If `acceptanceEvidence` is missing, raw source/runtime/adversarial/reentry fields can be converted into acceptance claims, but source plus runtime proof are still required.
 
 ## Preferred Invocation
 

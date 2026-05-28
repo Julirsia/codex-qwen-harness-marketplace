@@ -30,6 +30,9 @@ export const DEFAULT_MODEL_ROUTES = {
 };
 const DEFAULT_PI_MAX_BUFFER = 256 * 1024 * 1024;
 const DEFAULT_LOG_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_PI_ASSISTANT_TEXT_MAX_BYTES = 128 * 1024;
+const DEFAULT_PI_TOOL_OUTPUT_MAX_BYTES = 256 * 1024;
+const DEFAULT_PI_SUMMARY_MAX_TOOL_EXECUTIONS = 50;
 const DEFAULT_AUTONOMOUS_TIMEOUT_MS = 45 * 60 * 1000;
 const DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 15000;
@@ -84,8 +87,6 @@ export function nativeHybridPaths({ cwd = process.cwd() } = {}) {
     localReviewsDir: join(root, "local-reviews"),
     verificationDir: join(root, "verification"),
     verificationResults: join(root, "verification", "verification-results.json"),
-    evaluationDir: join(root, "evaluation"),
-    metrics: join(root, "evaluation", "metrics.jsonl"),
     proofDir: join(root, "proof"),
     claimEvidenceMatrix: join(root, "proof", "claim-evidence-matrix.md"),
     claimEvidenceMatrixJson: join(root, "proof", "claim-evidence-matrix.json"),
@@ -120,7 +121,6 @@ export function initHybridRun(options = {}) {
     paths.workerRunsDir,
     paths.localReviewsDir,
     paths.verificationDir,
-    paths.evaluationDir,
     paths.proofDir
   ]) {
     mkdirSync(dir, { recursive: true });
@@ -286,7 +286,6 @@ export function createCorrectionPackage(options = {}) {
 }
 
 export async function spawnWorker(options = {}) {
-  const startedAtMs = Date.now();
   const cwd = resolve(options.cwd ?? process.cwd());
   const paths = nativeHybridPaths({ cwd });
   ensureActiveHarness(paths);
@@ -371,18 +370,6 @@ export async function spawnWorker(options = {}) {
     };
     writeJson(evidencePath, evidence);
     writeFileSync(join(runDir, "worker-summary.md"), workerSummary(evidence), "utf8");
-    appendMetric(paths.metrics, runMetric({
-      workerRunId,
-      kind,
-      role,
-      model,
-      status: "failed",
-      startedAtMs,
-      tokenUsage: evidence.tokenUsage,
-      filesChanged: [],
-      exitCode: null,
-      providerPreflight
-    }));
     appendEvent(paths.events, { type: "worker_provider_preflight_failed", at: new Date().toISOString(), workerRunId, providerPreflight });
     return { ok: false, status: "failed", workerRunId, runDir, evidencePath, providerPreflight };
   }
@@ -393,8 +380,10 @@ export async function spawnWorker(options = {}) {
   let stdout = "";
   let stderr = "";
   let workerProcess = null;
-  const stdoutRawPath = join(runDir, "stdout.jsonl");
-  const stderrRawPath = join(runDir, "stderr.raw.log");
+  let toolExecutions = [];
+  let parsedUsage = emptyTokenUsage();
+  const stdoutSummaryPath = join(runDir, "stdout-summary.json");
+  const stderrCapturePath = join(runDir, "stderr-capture.log");
   const stdoutLogPath = join(runDir, "stdout.log");
   const stderrLogPath = join(runDir, "stderr.log");
   if (options.live) {
@@ -403,32 +392,32 @@ export async function spawnWorker(options = {}) {
       command: piBinary,
       args: piCommand.args,
       cwd,
-      stdoutPath: stdoutRawPath,
-      stderrPath: stderrRawPath,
+      stdoutPath: stdoutSummaryPath,
+      stderrPath: stderrCapturePath,
       timeoutMs,
       watchdogIntervalMs: positiveNumber(options.watchdogIntervalMs, DEFAULT_WATCHDOG_INTERVAL_MS),
       watchdog: async () => workerEvidenceReadyForWatchdog(evidencePath)
     });
-    stdout = readCompactFile(stdoutRawPath, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES));
-    stderr = readCompactFile(stderrRawPath, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES));
+    const piSummary = workerProcess.summary ?? readJson(stdoutSummaryPath) ?? {};
+    stdout = piSummaryText(piSummary);
+    stderr = readCompactFile(stderrCapturePath, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES));
+    toolExecutions = Array.isArray(piSummary.toolExecutions) ? piSummary.toolExecutions : [];
+    parsedUsage = tokenBucketHasValue(piSummary.tokenUsage?.local) ? piSummary.tokenUsage : emptyTokenUsage();
     exitCode = workerProcess.exitCode ?? (workerProcess.errorMessage ? 1 : 0);
     workerStatus = exitCode === 0 || workerProcess.watchdogTerminated ? "completed" : "failed";
-    writeFileSync(stdoutLogPath, stdout, "utf8");
+    writeFileSync(stdoutLogPath, compactLog(stdout, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES)), "utf8");
     writeFileSync(stderrLogPath, compactLog(stderr || workerProcess.errorMessage || "", Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES)), "utf8");
   } else {
     workerStatus = "dry-run";
   }
 
-  const toolExecutions = extractToolExecutions(stdout);
+  if (toolExecutions.length === 0) toolExecutions = extractToolExecutions(stdout);
   const verificationOutputPath = join(runDir, "test-output.log");
   if (toolExecutions.length > 0 && !readFileSync(verificationOutputPath, "utf8").trim()) {
     writeFileSync(verificationOutputPath, toolExecutions.map((execution) => execution.output).filter(Boolean).join("\n\n---\n\n"), "utf8");
   }
   const changedFiles = diffSnapshots(beforeSnapshot, snapshotWorkspace(cwd));
-  const parsedFileUsage = parsePiUsageFile(stdoutRawPath);
-  const parsedUsage = tokenBucketHasValue(parsedFileUsage.local)
-    ? parsedFileUsage
-    : parsePiUsage(stdout);
+  if (!tokenBucketHasValue(parsedUsage.local)) parsedUsage = parsePiUsage(stdout);
   const synthesizedAcceptance = synthesizeAcceptanceEvidence({ changedFiles, toolExecutions, verificationCommand, runDir });
   const existingEvidence = normalizeWorkerEvidence(readJson(evidencePath));
   const evidenceDraft = existingEvidence && typeof existingEvidence === "object" ? {
@@ -493,19 +482,6 @@ export async function spawnWorker(options = {}) {
   writeFileSync(join(runDir, "worker-summary.md"), workerSummary(evidence), "utf8");
   writeJson(join(runDir, "changed-files.json"), changedFiles);
   updateAggregateTokenUsage({ cwd, usage: evidence.tokenUsage });
-  appendMetric(paths.metrics, runMetric({
-    workerRunId,
-    kind,
-    role,
-    model,
-    status: evidence.status ?? workerStatus,
-    startedAtMs,
-    tokenUsage: evidence.tokenUsage,
-    filesChanged: changedFiles,
-    exitCode,
-    providerPreflight,
-    watchdogTerminated: workerProcess?.watchdogTerminated ?? false
-  }));
   clearActiveWorker({ cwd, workerRunId, status: evidence.status ?? workerStatus });
   appendEvent(paths.events, { type: "worker_run_recorded", at: new Date().toISOString(), workerRunId, status: workerStatus });
 
@@ -982,7 +958,6 @@ export function verifyPackage(options = {}) {
 }
 
 export function recoverActiveWorker(options = {}) {
-  const startedAtMs = Date.now();
   const cwd = resolve(options.cwd ?? process.cwd());
   const paths = nativeHybridPaths({ cwd });
   ensureActiveHarness(paths);
@@ -1038,17 +1013,6 @@ export function recoverActiveWorker(options = {}) {
   writeJson(evidencePath, evidence);
   writeJson(join(runDir, "changed-files.json"), Array.isArray(changedFiles) ? changedFiles : []);
   writeFileSync(join(runDir, "worker-summary.md"), workerSummary(evidence), "utf8");
-  appendMetric(paths.metrics, runMetric({
-    workerRunId: active.workerRunId,
-    kind: active.kind ?? "package",
-    role: workerRoleForKind(active.kind ?? "package"),
-    model: evidence.model,
-    status: `recovered:${evidence.status}`,
-    startedAtMs,
-    tokenUsage: evidence.tokenUsage,
-    filesChanged: evidence.filesChanged,
-    exitCode: null
-  }));
   clearActiveWorker({ cwd, workerRunId: active.workerRunId, status: `recovered:${evidence.status}` });
   updatePhase({
     cwd,
@@ -1060,7 +1024,6 @@ export function recoverActiveWorker(options = {}) {
 }
 
 export function runLocalReview(options = {}) {
-  const startedAtMs = Date.now();
   const cwd = resolve(options.cwd ?? process.cwd());
   const paths = nativeHybridPaths({ cwd });
   ensureActiveHarness(paths);
@@ -1108,18 +1071,6 @@ export function runLocalReview(options = {}) {
     };
     writeJson(join(reviewDir, "review.json"), review);
     writeFileSync(join(reviewDir, "review.md"), localReviewMarkdown(review), "utf8");
-    appendMetric(paths.metrics, runMetric({
-      workerRunId: reviewId,
-      kind: "review",
-      role: "review",
-      model,
-      status: "failed",
-      startedAtMs,
-      tokenUsage: review.tokenUsage,
-      filesChanged: [],
-      exitCode: null,
-      providerPreflight
-    }));
     appendEvent(paths.events, { type: "local_review_provider_preflight_failed", at: review.completedAt, reviewId, packageId, providerPreflight });
     return { ok: false, status: "failed", reviewId, reviewPath: join(reviewDir, "review.json"), verdict: "ERROR", providerPreflight };
   }
@@ -1165,18 +1116,6 @@ export function runLocalReview(options = {}) {
   writeJson(join(reviewDir, "review.json"), review);
   writeFileSync(join(reviewDir, "review.md"), localReviewMarkdown(review), "utf8");
   updateAggregateTokenUsage({ cwd, usage: tokenUsage });
-  appendMetric(paths.metrics, runMetric({
-    workerRunId: reviewId,
-    kind: "review",
-    role: "review",
-    model,
-    status: review.status,
-    startedAtMs,
-    tokenUsage,
-    filesChanged: [],
-    exitCode,
-    providerPreflight
-  }));
   appendEvent(paths.events, { type: "local_review_recorded", at: review.completedAt, reviewId, packageId, verdict: review.verdict });
   return { ok: status !== "failed", status, reviewId, reviewPath: join(reviewDir, "review.json"), verdict: review.verdict };
 }
@@ -1228,26 +1167,6 @@ export function runFinalGate(options = {}) {
   else updatePhase({ cwd, phase: "final_gate", nextAction: "Resolve blocking final proof issues." });
   appendEvent(paths.events, { type: "final_gate_checked", at: finalGate.checkedAt, verdict, goalAchieved });
   return { ok: true, finalGate };
-}
-
-export function summarizeEvaluation(options = {}) {
-  const root = resolve(options.scanRoot ?? options.cwd ?? process.cwd());
-  const projectCwds = options.scanRoot
-    ? discoverHarnessCwds(root, Number(options.maxDepth ?? 3))
-    : [resolve(options.cwd ?? process.cwd())];
-  const projects = projectCwds
-    .map((projectCwd) => summarizeEvaluationProject(projectCwd))
-    .filter(Boolean);
-  const aggregate = aggregateEvaluationProjects(projects);
-  return {
-    ok: true,
-    generatedAt: new Date().toISOString(),
-    scanRoot: options.scanRoot ? root : null,
-    projectCount: projects.length,
-    aggregate,
-    recommendation: evaluationRecommendation(aggregate),
-    projects
-  };
 }
 
 export async function runHookCli({ stdin = process.stdin, stdout = process.stdout, cwd = process.cwd() } = {}) {
@@ -1856,294 +1775,6 @@ function findLatestEvidence(workerRunsDir, packageId) {
   return null;
 }
 
-function discoverHarnessCwds(root, maxDepth) {
-  const found = [];
-  const limit = Number.isFinite(maxDepth) && maxDepth >= 0 ? maxDepth : 3;
-  visit(resolve(root), 0);
-  return [...new Set(found)].sort();
-
-  function visit(dir, depth) {
-    if (existsSync(join(dir, CANONICAL_STATE_DIR, "state.json"))) {
-      found.push(dir);
-      return;
-    }
-    if (depth >= limit) return;
-    for (const name of safeReadDir(dir)) {
-      if ([".git", "node_modules", "dist", "build", ".next", ".codex"].includes(name)) continue;
-      const path = join(dir, name);
-      try {
-        if (lstatSync(path).isDirectory()) visit(path, depth + 1);
-      } catch {
-        // Ignore unreadable scan entries.
-      }
-    }
-  }
-}
-
-function summarizeEvaluationProject(cwd) {
-  const paths = nativeHybridPaths({ cwd });
-  if (!existsSync(paths.state)) return null;
-  const state = readJson(paths.state) ?? {};
-  const metrics = readJsonl(paths.metrics);
-  const evidenceRuns = collectWorkerEvidence(paths.workerRunsDir);
-  const localReviews = collectLocalReviews(paths.localReviewsDir);
-  const runs = mergeMetricAndEvidenceRuns({ metrics, evidenceRuns, localReviews });
-  const verificationResults = readJson(paths.verificationResults) ?? { reviews: [] };
-  const packageReviews = Array.isArray(verificationResults.reviews) ? verificationResults.reviews : [];
-  const finalGate = readJson(paths.finalGate) ?? null;
-  return {
-    cwd,
-    taskId: state.taskId ?? null,
-    title: state.title ?? state.taskId ?? null,
-    phase: state.phase ?? null,
-    modelRoutes: state.models?.routes ?? null,
-    runs: runs.map((run) => ({
-      workerRunId: run.workerRunId,
-      kind: run.kind,
-      role: run.role,
-      model: run.model,
-      status: run.status,
-      durationMs: numberValue(run.durationMs),
-      tokenUsage: run.tokenUsage ?? emptyTokenUsage(),
-      filesChangedCount: numberValue(run.filesChangedCount),
-      providerPreflight: run.providerPreflight ? {
-        ok: run.providerPreflight.ok,
-        targetModel: run.providerPreflight.targetModel,
-        targetRunning: run.providerPreflight.targetRunning,
-        blockers: run.providerPreflight.blockers ?? []
-      } : null
-    })),
-    runSummary: summarizeRuns(runs),
-    packageReviews: packageReviews.map((review) => ({
-      packageId: review.packageId,
-      verdict: review.verdict,
-      claimCount: Array.isArray(review.claims) ? review.claims.length : 0,
-      blockingIssues: review.blockingIssues ?? []
-    })),
-    localReviews: localReviews.map((review) => ({
-      reviewId: review.reviewId,
-      packageId: review.packageId,
-      model: review.model,
-      verdict: review.verdict,
-      status: review.status,
-      tokenUsage: review.tokenUsage ?? emptyTokenUsage()
-    })),
-    finalGate: finalGate ? {
-      verdict: finalGate.verdict,
-      goalAchieved: finalGate.goalAchieved,
-      blockingIssues: finalGate.blockingIssues ?? []
-    } : null,
-    failedEvidence: evidenceRuns
-      .filter((run) => run.status && run.status !== "completed" && run.status !== "dry-run")
-      .map((run) => ({
-        workerRunId: run.workerRunId,
-        model: run.model,
-        status: run.status,
-        blockers: run.blockers ?? [],
-        providerPreflight: run.providerPreflight ? {
-          ok: run.providerPreflight.ok,
-          targetModel: run.providerPreflight.targetModel,
-          targetRunning: run.providerPreflight.targetRunning,
-          blockers: run.providerPreflight.blockers ?? []
-        } : null
-      }))
-  };
-}
-
-function collectWorkerEvidence(workerRunsDir) {
-  if (!existsSync(workerRunsDir)) return [];
-  return safeReadDir(workerRunsDir)
-    .map((name) => readJson(join(workerRunsDir, name, "evidence.json")))
-    .map((value) => normalizeWorkerEvidence(value))
-    .filter((value) => value && typeof value === "object");
-}
-
-function collectLocalReviews(localReviewsDir) {
-  if (!existsSync(localReviewsDir)) return [];
-  return safeReadDir(localReviewsDir)
-    .map((name) => readJson(join(localReviewsDir, name, "review.json")))
-    .filter((value) => value && typeof value === "object");
-}
-
-function mergeMetricAndEvidenceRuns({ metrics, evidenceRuns, localReviews }) {
-  const runs = Array.isArray(metrics) ? [...metrics] : [];
-  const seen = new Set(runs.map((run) => run.workerRunId).filter(Boolean));
-  for (const evidence of evidenceRuns) {
-    if (!evidence.workerRunId || seen.has(evidence.workerRunId)) continue;
-    runs.push(metricFromEvidence(evidence));
-    seen.add(evidence.workerRunId);
-  }
-  for (const review of localReviews) {
-    if (!review.reviewId || seen.has(review.reviewId)) continue;
-    runs.push({
-      version: 1,
-      at: review.completedAt ?? null,
-      workerRunId: review.reviewId,
-      kind: "review",
-      role: "review",
-      model: review.model,
-      status: review.status,
-      durationMs: 0,
-      tokenUsage: review.tokenUsage ?? emptyTokenUsage(),
-      filesChanged: [],
-      filesChangedCount: 0,
-      exitCode: review.status === "completed" ? 0 : null,
-      providerPreflight: review.providerPreflight ?? null
-    });
-    seen.add(review.reviewId);
-  }
-  return runs;
-}
-
-function metricFromEvidence(evidence) {
-  const normalized = normalizeWorkerEvidence(evidence);
-  return {
-    version: 1,
-    at: normalized.completedAt ?? null,
-    workerRunId: normalized.workerRunId,
-    kind: normalized.phase === "scout_worker" ? "scout" : normalized.phase === "correction_worker" ? "correction" : "package",
-    role: normalized.phase === "scout_worker" ? "scout" : normalized.phase === "correction_worker" ? "correction" : "implementation",
-    model: normalized.model,
-    status: normalized.status,
-    durationMs: durationBetween(normalized.startedAt, normalized.completedAt),
-    tokenUsage: normalized.tokenUsage ?? emptyTokenUsage(),
-    filesChanged: normalized.filesChanged ?? [],
-    filesChangedCount: Array.isArray(normalized.filesChanged) ? normalized.filesChanged.length : 0,
-    exitCode: Array.isArray(normalized.commandsRun) ? normalized.commandsRun.find((command) => command.exitCode !== undefined)?.exitCode ?? null : null,
-    providerPreflight: normalized.providerPreflight ?? null
-  };
-}
-
-function summarizeRuns(runs) {
-  const summary = {
-    totalRuns: runs.length,
-    completed: 0,
-    failed: 0,
-    blocked: 0,
-    dryRun: 0,
-    durationMs: 0,
-    tokenUsage: emptyTokenUsage(),
-    byModel: {},
-    byRole: {},
-    providerPreflightFailures: 0
-  };
-  for (const run of runs) {
-    const status = run.status ?? "unknown";
-    if (status === "completed" || status === "recovered:completed") summary.completed += 1;
-    else if (status === "dry-run") summary.dryRun += 1;
-    else if (status === "blocked") summary.blocked += 1;
-    else summary.failed += 1;
-    summary.durationMs += numberValue(run.durationMs);
-    summary.tokenUsage = mergeTokenUsage(summary.tokenUsage, run.tokenUsage);
-    if (run.providerPreflight && run.providerPreflight.ok === false) summary.providerPreflightFailures += 1;
-    addGroupedRun(summary.byModel, run.model ?? "unknown", run);
-    addGroupedRun(summary.byRole, run.role ?? run.kind ?? "unknown", run);
-  }
-  summary.successRate = summary.totalRuns > 0 ? summary.completed / summary.totalRuns : 0;
-  return summary;
-}
-
-function addGroupedRun(target, key, run) {
-  const bucket = target[key] ?? {
-    totalRuns: 0,
-    completed: 0,
-    failed: 0,
-    durationMs: 0,
-    tokenUsage: emptyTokenUsage(),
-    filesChangedCount: 0,
-    providerPreflightFailures: 0
-  };
-  bucket.totalRuns += 1;
-  if (run.status === "completed" || run.status === "recovered:completed") bucket.completed += 1;
-  else if (run.status !== "dry-run") bucket.failed += 1;
-  bucket.durationMs += numberValue(run.durationMs);
-  bucket.tokenUsage = mergeTokenUsage(bucket.tokenUsage, run.tokenUsage);
-  bucket.filesChangedCount += numberValue(run.filesChangedCount);
-  if (run.providerPreflight && run.providerPreflight.ok === false) bucket.providerPreflightFailures += 1;
-  bucket.successRate = bucket.totalRuns > 0 ? bucket.completed / bucket.totalRuns : 0;
-  target[key] = bucket;
-}
-
-function aggregateEvaluationProjects(projects) {
-  const runs = projects.flatMap((project) => project.runs ?? []);
-  const approvedProjectRuns = projects
-    .filter((project) => project.finalGate?.verdict === "APPROVE")
-    .flatMap((project) => project.runs ?? []);
-  const completedRuns = runs.filter((run) => run.status === "completed" || run.status === "recovered:completed");
-  const failedRuns = runs.filter((run) => run.status && run.status !== "completed" && run.status !== "recovered:completed" && run.status !== "dry-run");
-  const runSummary = summarizeRuns(runs);
-  const approvedRunSummary = summarizeRuns(approvedProjectRuns);
-  const completedRunSummary = summarizeRuns(completedRuns);
-  const failedRunSummary = summarizeRuns(failedRuns);
-  const aggregate = {
-    totalProjects: projects.length,
-    approvedProjects: projects.filter((project) => project.finalGate?.verdict === "APPROVE").length,
-    projectsWithBlockingFinalGate: projects.filter((project) => project.finalGate && project.finalGate.verdict !== "APPROVE").length,
-    totalPackageReviews: projects.reduce((sum, project) => sum + project.packageReviews.length, 0),
-    passingPackageReviews: projects.reduce((sum, project) => sum + project.packageReviews.filter((review) => review.verdict === "PASS").length, 0),
-    totalLocalReviews: projects.reduce((sum, project) => sum + project.localReviews.length, 0),
-    passingLocalReviews: projects.reduce((sum, project) => sum + project.localReviews.filter((review) => review.verdict === "PASS").length, 0),
-    runSummary,
-    failurePatterns: collectFailurePatterns(projects)
-  };
-  aggregate.lowerBoundLocalTokensOffloaded = aggregate.runSummary.tokenUsage.local.total;
-  aggregate.tokenAccounting = {
-    lowerBoundLocalTokensOffloaded: aggregate.runSummary.tokenUsage.local.total,
-    approvedProjectLocalTokensOffloaded: approvedRunSummary.tokenUsage.local.total,
-    completedRunLocalTokensOffloaded: completedRunSummary.tokenUsage.local.total,
-    failedRunLocalTokensSpent: failedRunSummary.tokenUsage.local.total,
-    frontierTokensSpent: aggregate.runSummary.tokenUsage.frontier.total,
-    note: "Local token totals are a lower-bound estimate of frontier tokens avoided when the same prompts would otherwise have run in Codex/frontier context."
-  };
-  return aggregate;
-}
-
-function collectFailurePatterns(projects) {
-  const patterns = {};
-  for (const project of projects) {
-    for (const item of project.failedEvidence ?? []) {
-      for (const blocker of item.blockers ?? []) {
-        const key = String(blocker).slice(0, 160);
-        patterns[key] = (patterns[key] ?? 0) + 1;
-      }
-      for (const blocker of item.providerPreflight?.blockers ?? []) {
-        const key = `provider: ${String(blocker).slice(0, 160)}`;
-        patterns[key] = (patterns[key] ?? 0) + 1;
-      }
-    }
-  }
-  return Object.entries(patterns)
-    .sort((a, b) => b[1] - a[1])
-    .map(([pattern, count]) => ({ pattern, count }));
-}
-
-function evaluationRecommendation(aggregate) {
-  const byModel = aggregate.runSummary?.byModel ?? {};
-  const implementationModel = normalizeProviderModel(DEFAULT_IMPLEMENTATION_MODEL);
-  const reviewModel = normalizeProviderModel(DEFAULT_REVIEW_MODEL);
-  return {
-    recommendedRoutes: DEFAULT_MODEL_ROUTES,
-    rationale: [
-      `${implementationModel} remains the default implementation/correction route because completed implementation evidence exists on code-heavy/browser tasks and the user reports stronger coding ability.`,
-      `${reviewModel} remains the default scout/review route because supplemental review catches evidence-contract problems and produces useful audit findings.`,
-      "Use provider preflight for every live worker. Model switching is allowed by default so the role's intended model is used; set --disallow-model-switch only for explicitly non-evicting diagnostic runs."
-    ],
-    observedModels: Object.fromEntries(Object.entries(byModel).map(([model, bucket]) => [model, {
-      runs: bucket.totalRuns,
-      successRate: bucket.successRate,
-      localTokens: bucket.tokenUsage?.local?.total ?? 0,
-      providerPreflightFailures: bucket.providerPreflightFailures ?? 0
-    }]))
-  };
-}
-
-function durationBetween(startedAt, completedAt) {
-  const start = Date.parse(startedAt ?? "");
-  const end = Date.parse(completedAt ?? "");
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
-  return Math.max(0, end - start);
-}
-
 function safeReadDir(path) {
   try {
     return readdirSync(path);
@@ -2455,7 +2086,6 @@ You must complete the implementation, test loop, and compact evidence by yoursel
 - Your current working directory is the project root:
   ${projectDir}
 - Create and edit files only inside this directory.
-- Do not create files in the benchmark/spec directory.
 - Do not create or modify files outside the current working directory.
 - Use relative paths in evidence.
 
@@ -2529,7 +2159,7 @@ ${JSON.stringify(validation, null, 2)}
 async function runAutonomousPiAttempt({ options, projectDir, runDir, prompt, command, evidenceFile, minTests, requiredFiles }) {
   mkdirSync(runDir, { recursive: true });
   const promptPath = join(runDir, "prompt.md");
-  const stdoutPath = join(runDir, "pi.stdout.jsonl");
+  const stdoutPath = join(runDir, "pi.stdout-summary.json");
   const stderrPath = join(runDir, "pi.stderr.log");
   writeFileSync(promptPath, prompt, "utf8");
 
@@ -2576,7 +2206,7 @@ async function runAutonomousPiAttempt({ options, projectDir, runDir, prompt, com
     promptPath,
     stdoutPath,
     stderrPath,
-    tokenUsage: parsePiUsageFile(stdoutPath)
+    tokenUsage: result.summary?.tokenUsage ?? parsePiUsageFile(stdoutPath)
   };
 }
 
@@ -2614,8 +2244,8 @@ async function runPiProcessToFiles({
 }) {
   mkdirSync(dirname(stdoutPath), { recursive: true });
   mkdirSync(dirname(stderrPath), { recursive: true });
-  const stdoutFd = openSync(stdoutPath, "w");
-  const stderrFd = openSync(stderrPath, "w");
+  const stdoutSummary = createPiStreamSummary();
+  const stderrCapture = createLimitedTextCapture(DEFAULT_LOG_MAX_BYTES);
   const startedAtMs = Date.now();
   let child;
   let settled = false;
@@ -2630,7 +2260,7 @@ async function runPiProcessToFiles({
     try {
       child = spawn(command, args, {
         cwd,
-        stdio: ["ignore", stdoutFd, stderrFd],
+        stdio: ["ignore", "pipe", "pipe"],
         shell: false
       });
     } catch (error) {
@@ -2640,6 +2270,12 @@ async function runPiProcessToFiles({
       resolveFinish();
       return;
     }
+    child.stdout?.on("data", (chunk) => {
+      stdoutSummary.ingest(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderrCapture.ingest(chunk);
+    });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -2698,9 +2334,11 @@ async function runPiProcessToFiles({
     }
     if (!settled) await finishPromise;
   } finally {
-    closeSync(stdoutFd);
-    closeSync(stderrFd);
+    stdoutSummary.finish();
+    writeJson(stdoutPath, stdoutSummary.snapshot());
+    writeFileSync(stderrPath, stderrCapture.text(), "utf8");
   }
+  const summary = readJson(stdoutPath) ?? stdoutSummary.snapshot();
 
   return {
     exitCode,
@@ -2710,7 +2348,8 @@ async function runPiProcessToFiles({
     watchdogReason,
     errorMessage,
     pid: child?.pid ?? null,
-    durationMs: Math.max(0, Date.now() - startedAtMs)
+    durationMs: Math.max(0, Date.now() - startedAtMs),
+    summary
   };
 }
 
@@ -2958,6 +2597,10 @@ function parsePiUsageLine(line, usage) {
   } catch {
     return;
   }
+  applyPiUsageEvent(event, usage);
+}
+
+function applyPiUsageEvent(event, usage) {
   const messageUsage = event?.message?.usage
     ?? event?.usage
     ?? event?.assistantMessageEvent?.partial?.usage
@@ -2982,9 +2625,7 @@ function extractFinalAssistantText(stdout) {
     } catch {
       continue;
     }
-    const message = event?.message ?? event?.assistantMessageEvent?.partial;
-    if (message?.role !== "assistant") continue;
-    const text = contentText(message.content);
+    const text = assistantTextFromPiEvent(event);
     if (text.trim()) latest = text;
   }
   return latest.trim();
@@ -3000,16 +2641,130 @@ function extractToolExecutions(stdout) {
     } catch {
       continue;
     }
-    if (event?.type !== "tool_execution_end") continue;
-    const output = toolResultText(event.result);
-    executions.push({
-      toolName: event.toolName ?? null,
-      command: event.args?.command ?? event.toolCall?.arguments?.command ?? event.toolName ?? "tool execution",
-      output,
-      exitCode: inferExitCode(output, event.isError)
-    });
+    const execution = toolExecutionFromPiEvent(event);
+    if (execution) executions.push(execution);
   }
   return executions;
+}
+
+function assistantTextFromPiEvent(event) {
+  const message = event?.message ?? event?.assistantMessageEvent?.partial;
+  if (message?.role !== "assistant") return "";
+  return contentText(message.content);
+}
+
+function toolExecutionFromPiEvent(event) {
+  if (event?.type !== "tool_execution_end") return null;
+  const output = toolResultText(event.result);
+  return {
+    toolName: event.toolName ?? null,
+    command: event.args?.command ?? event.toolCall?.arguments?.command ?? event.toolName ?? "tool execution",
+    output,
+    exitCode: inferExitCode(output, event.isError)
+  };
+}
+
+function createPiStreamSummary() {
+  const summary = {
+    rawStdoutCaptured: false,
+    stdoutBytes: 0,
+    stdoutLines: 0,
+    parseErrors: 0,
+    tokenUsage: emptyTokenUsage(),
+    finalAssistantText: "",
+    toolExecutions: []
+  };
+  let carry = "";
+  const ingestLine = (line) => {
+    if (!String(line ?? "").trim()) return;
+    summary.stdoutLines += 1;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      summary.parseErrors += 1;
+      return;
+    }
+    applyPiUsageEvent(event, summary.tokenUsage);
+    const text = assistantTextFromPiEvent(event);
+    if (text.trim()) summary.finalAssistantText = compactLog(text, DEFAULT_PI_ASSISTANT_TEXT_MAX_BYTES);
+    const execution = toolExecutionFromPiEvent(event);
+    if (execution) {
+      summary.toolExecutions.push({
+        ...execution,
+        output: compactLog(execution.output, DEFAULT_PI_TOOL_OUTPUT_MAX_BYTES)
+      });
+      if (summary.toolExecutions.length > DEFAULT_PI_SUMMARY_MAX_TOOL_EXECUTIONS) {
+        summary.toolExecutions.splice(0, summary.toolExecutions.length - DEFAULT_PI_SUMMARY_MAX_TOOL_EXECUTIONS);
+      }
+    }
+  };
+  return {
+    ingest(chunk) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      summary.stdoutBytes += buffer.length;
+      const text = `${carry}${buffer.toString("utf8")}`;
+      const lines = text.split(/\r?\n/);
+      carry = lines.pop() ?? "";
+      for (const line of lines) ingestLine(line);
+    },
+    finish() {
+      if (carry.trim()) ingestLine(carry);
+      carry = "";
+    },
+    snapshot() {
+      return {
+        ...summary,
+        note: "Raw pi stdout is not stored. This file keeps only parsed usage, compact assistant text, and compact tool execution summaries."
+      };
+    }
+  };
+}
+
+function createLimitedTextCapture(maxBytes) {
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_LOG_MAX_BYTES;
+  let totalBytes = 0;
+  let retainedBytes = 0;
+  const chunks = [];
+  return {
+    ingest(chunk) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      totalBytes += buffer.length;
+      if (buffer.length >= limit) {
+        chunks.splice(0, chunks.length, buffer.subarray(buffer.length - limit));
+        retainedBytes = chunks[0].length;
+        return;
+      }
+      chunks.push(buffer);
+      retainedBytes += buffer.length;
+      while (retainedBytes > limit && chunks.length > 1) {
+        const first = chunks.shift();
+        retainedBytes -= first.length;
+      }
+    },
+    text() {
+      const retained = Buffer.concat(chunks).toString("utf8");
+      if (totalBytes <= retainedBytes) return retained;
+      return `[stderr compacted by qwen-harness-codex: originalBytes=${totalBytes}, retainedTailBytes=${retainedBytes}]\n${retained}`;
+    }
+  };
+}
+
+function piSummaryText(summary) {
+  if (!summary || typeof summary !== "object") return "";
+  return [
+    "Pi stdout summary",
+    `rawStdoutCaptured: ${summary.rawStdoutCaptured === true ? "true" : "false"}`,
+    `stdoutBytes: ${numberValue(summary.stdoutBytes)}`,
+    `stdoutLines: ${numberValue(summary.stdoutLines)}`,
+    `parseErrors: ${numberValue(summary.parseErrors)}`,
+    `localTokens: ${numberValue(summary.tokenUsage?.local?.total)} input=${numberValue(summary.tokenUsage?.local?.input)} output=${numberValue(summary.tokenUsage?.local?.output)}`,
+    "",
+    "Final assistant text:",
+    summary.finalAssistantText ?? "",
+    "",
+    `Tool executions retained: ${Array.isArray(summary.toolExecutions) ? summary.toolExecutions.length : 0}`
+  ].join("\n");
 }
 
 function toolResultText(result) {
@@ -3357,36 +3112,6 @@ function updateAggregateTokenUsage({ cwd, usage }) {
   }
 }
 
-function runMetric({ workerRunId, kind, role, model, status, startedAtMs, tokenUsage, filesChanged, exitCode, providerPreflight = null, watchdogTerminated = false }) {
-  const endedAtMs = Date.now();
-  return {
-    version: 1,
-    at: new Date(endedAtMs).toISOString(),
-    workerRunId,
-    kind,
-    role,
-    model,
-    status,
-    durationMs: Math.max(0, endedAtMs - startedAtMs),
-    tokenUsage: tokenUsage ?? emptyTokenUsage(),
-    filesChanged: Array.isArray(filesChanged) ? filesChanged : [],
-    filesChangedCount: Array.isArray(filesChanged) ? filesChanged.length : 0,
-    exitCode,
-    watchdogTerminated,
-    providerPreflight: providerPreflight ? {
-      ok: providerPreflight.ok,
-      targetModel: providerPreflight.targetModel,
-      targetRunning: providerPreflight.targetRunning,
-      probe: providerPreflight.probe,
-      blockers: providerPreflight.blockers ?? []
-    } : null
-  };
-}
-
-function appendMetric(path, metric) {
-  appendEvent(path, metric);
-}
-
 function mergeUnique(...lists) {
   return [...new Set(lists.flatMap((list) => Array.isArray(list) ? list : []).filter((value) => typeof value === "string" && value.trim()))].sort();
 }
@@ -3402,22 +3127,6 @@ function readJson(path) {
   } catch {
     return undefined;
   }
-}
-
-function readJsonl(path) {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
 }
 
 function writeJson(path, value) {
@@ -3549,11 +3258,6 @@ async function main(argv = process.argv.slice(2)) {
     case "provider-health":
       print(checkLlamaSwapProvider(opts));
       break;
-    case "evaluation-report":
-    case "evaluation-summary":
-    case "benchmark-summary":
-      print(summarizeEvaluation(opts));
-      break;
     case "autonomous-run":
     case "autonomous-lite":
       print(await runAutonomous(opts));
@@ -3582,7 +3286,7 @@ async function main(argv = process.argv.slice(2)) {
     case "help":
     case "--help":
     case "-h":
-      console.log("qwen-harness-codex hybrid-run|hybrid-status|worker|recover-worker|local-review|model-health|evaluation-report|autonomous-run|autonomous-status|autonomous-validate|verify-package|create-correction|final-gate|codex-native-hook");
+      console.log("qwen-harness-codex hybrid-run|hybrid-status|worker|recover-worker|local-review|model-health|autonomous-run|autonomous-status|autonomous-validate|verify-package|create-correction|final-gate|codex-native-hook");
       break;
     default:
       throw new Error(`unknown command: ${command}`);

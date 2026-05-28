@@ -26,8 +26,8 @@ Autonomous-lite is the token-saving mode.
 4. Qwen implements, tests, repairs internally, and writes `evidence.json`.
 5. Codex validates `evidence.json` and the configured verification command.
 
-Codex must not read `.qwen-autonomous/runs/*/pi.stdout.jsonl` during benchmark measurement.
-For MCP usage, run autonomous-lite as a detached job and poll compact status. The runner has a watchdog that terminates Pi after evidence plus verification pass, and token usage is parsed from the JSONL file instead of full stdout.
+Codex should read only compact state, evidence, and verification logs.
+For MCP usage, run autonomous-lite as a detached job and poll compact status. The runner has a watchdog that terminates Pi after evidence plus verification pass, and Pi stdout is summarized while streaming instead of being stored as a raw log.
 
 ## Preferred Invocation
 
