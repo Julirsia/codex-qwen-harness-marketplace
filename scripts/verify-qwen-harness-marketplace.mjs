@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pluginRoot = join(repoRoot, "plugins", "qwen-harness-codex");
-const expectedVersion = "0.1.0+codex.20260527143033";
+const expectedVersion = "0.1.0+codex.20260528073759";
 const expectedTools = [
   "codex_harness_hybrid_run",
   "codex_harness_hybrid_status",
@@ -14,6 +14,7 @@ const expectedTools = [
   "codex_harness_model_health",
   "codex_harness_verify_package",
   "codex_harness_evaluation_report",
+  "codex_harness_autonomous_run",
   "codex_harness_create_correction",
   "codex_harness_final_gate",
 ];

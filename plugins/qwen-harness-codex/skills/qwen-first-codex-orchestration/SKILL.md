@@ -1,11 +1,11 @@
 ---
 name: qwen-first-codex-orchestration
-description: Use when the user wants a Codex-native hybrid run where Codex owns design/review/final gates and Pi launches local Qwen workers for scout, implementation, tests, repairs, and evidence drafts.
+description: Use when the user wants a Codex-native Qwen harness run, including heavy hybrid-run orchestration or autonomous-lite mode where local Qwen implements, tests, and repairs while Codex validates compact evidence only.
 ---
 
 # Qwen First Codex Orchestration
 
-Use this skill when the user asks for `hybrid-run`, `qwen-first`, local Qwen implementation, token-saving delegation, or Pi/Qwen-backed implementation.
+Use this skill when the user asks for `hybrid-run`, `qwen-first`, `autonomous-run`, `autonomous-lite`, local Qwen implementation, token-saving delegation, or Pi/Qwen-backed implementation.
 
 ## Ownership Model
 
@@ -19,7 +19,7 @@ Codex must not directly mutate product files during an active hybrid-run.
 
 Codex should create implementation packages and correction packages, then invoke Qwen workers through the harness.
 
-## Required Flow
+## Heavy Hybrid Flow
 
 1. Run scout through a local Qwen worker via Pi.
 2. Have Codex write requirements, design, design grill, decisions, and implementation packages in `.qwen-harness/`.
@@ -30,14 +30,28 @@ Codex should create implementation packages and correction packages, then invoke
 7. Repeat verification and correction until package evidence passes or escalation is required.
 8. Run the final proof gate. Only Codex may decide `goalAchieved`.
 
+## Autonomous Lite Flow
+
+Use this mode when the priority is Codex token reduction and the task can be expressed as a clear executable contract.
+
+1. Codex provides a concise task/spec and verification contract.
+2. The harness creates `.qwen-autonomous/` in the target project.
+3. Pi launches local Qwen with cwd fixed to the target project directory.
+4. Qwen implements, runs tests, repairs internally, and writes compact `evidence.json`.
+5. Codex validates only `evidence.json` plus the configured verification command output.
+6. If validation fails, Qwen receives a compact validation summary for repair; Codex does not read full worker logs.
+
 ## Hard Rules
 
 - Active state belongs in `.qwen-harness/`.
+- Autonomous-lite state belongs in `.qwen-autonomous/`.
 - Do not create `.codex-harness/` or use `.pi-harness/` as Codex-native active state.
 - Do not let Pi own frontier design, package verification, final approval, or goal-achieved judgment.
 - Do not treat smoke-only output as behavioral acceptance evidence.
 - Do not accept worker self-report without source evidence, runtime evidence, adversarial probes, reentry probes where needed, and residual gap notes.
 - Do not directly edit product source/test/config during an active hybrid-run.
+- In autonomous-lite mode, do not read or summarize `.qwen-autonomous/runs/*/pi.stdout.jsonl`; use compact evidence and verification logs only.
+- Reject zero-test success and parent-package npm walkups.
 
 ## Commands
 
@@ -48,4 +62,15 @@ qwen-harness-codex worker --package P001 --live
 qwen-harness-codex verify-package --package P001
 qwen-harness-codex create-correction --package P001 --review .qwen-harness/verification/P001-review.md
 qwen-harness-codex final-gate
+
+qwen-harness-codex autonomous-run \
+  --project projects/p15-example \
+  --task-file benchmarks/p15-task.md \
+  --min-tests 20 \
+  --verification-command npm test
+
+qwen-harness-codex autonomous-validate \
+  --project projects/p15-example \
+  --min-tests 20 \
+  --verification-command npm test
 ```

@@ -4,6 +4,7 @@ import {
   createCorrectionPackage,
   initHybridRun,
   loadHybridStatus,
+  runAutonomous,
   runFinalGate,
   spawnWorker,
   summarizeEvaluation,
@@ -68,6 +69,27 @@ const tools = [
     })
   },
   {
+    name: "codex_harness_autonomous_run",
+    description: "Run autonomous-lite mode: local Qwen implements, tests, repairs internally, and Codex validates compact evidence only.",
+    inputSchema: objectSchema({
+      project: { type: "string" },
+      cwd: { type: "string" },
+      task: { type: "string" },
+      taskFile: { type: "string" },
+      model: { type: "string" },
+      verificationCommand: { type: "array", items: { type: "string" } },
+      minTests: { type: "number" },
+      repairAttempts: { type: "number" },
+      maxInternalLoops: { type: "number" },
+      evidenceFile: { type: "string" },
+      allowExisting: { type: "boolean" },
+      dryRun: { type: "boolean" },
+      validateOnly: { type: "boolean" },
+      timeoutMs: { type: "number" },
+      verifyTimeoutMs: { type: "number" }
+    })
+  },
+  {
     name: "codex_harness_create_correction",
     description: "Create a Codex-authored correction package for a failed package review.",
     inputSchema: objectSchema({
@@ -91,6 +113,7 @@ const handlers = {
   codex_harness_model_health: checkLlamaSwapProvider,
   codex_harness_verify_package: verifyPackage,
   codex_harness_evaluation_report: summarizeEvaluation,
+  codex_harness_autonomous_run: runAutonomous,
   codex_harness_create_correction: createCorrectionPackage,
   codex_harness_final_gate: runFinalGate
 };

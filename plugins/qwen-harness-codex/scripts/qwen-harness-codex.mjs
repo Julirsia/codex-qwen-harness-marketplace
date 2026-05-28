@@ -2,9 +2,11 @@
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   writeFileSync
@@ -14,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const CANONICAL_STATE_DIR = ".qwen-harness";
+export const AUTONOMOUS_STATE_DIR = ".qwen-autonomous";
 export const DEFAULT_IMPLEMENTATION_MODEL = "llama-local/qwen36-27b-mtp-iq4xs";
 export const DEFAULT_REVIEW_MODEL = "llama-local/qwen36-35b-a3b-iq4xs";
 export const DEFAULT_SCOUT_MODEL = DEFAULT_REVIEW_MODEL;
@@ -26,6 +29,8 @@ export const DEFAULT_MODEL_ROUTES = {
 };
 const DEFAULT_PI_MAX_BUFFER = 256 * 1024 * 1024;
 const DEFAULT_LOG_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_AUTONOMOUS_TIMEOUT_MS = 45 * 60 * 1000;
+const DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_PROVIDER_TIMEOUT_MS = 120000;
 const DEFAULT_PROVIDER_STATUS_TIMEOUT_MS = 5000;
 
@@ -481,6 +486,182 @@ export function spawnWorker(options = {}) {
   appendEvent(paths.events, { type: "worker_run_recorded", at: new Date().toISOString(), workerRunId, status: workerStatus });
 
   return { ok: evidence.status !== "failed", status: evidence.status, workerRunId, runDir, evidencePath };
+}
+
+export function runAutonomous(options = {}) {
+  const projectDir = resolve(options.project ?? options.cwd ?? process.cwd());
+  const verificationCommand = normalizeCommand(options.verificationCommand);
+  const command = verificationCommand.length ? verificationCommand : ["npm", "test"];
+  const commandText = command.join(" ");
+  const minTests = nonNegativeInteger(options.minTests, 1);
+  const repairAttempts = nonNegativeInteger(options.repairAttempts, 1);
+  const maxInternalLoops = nonNegativeInteger(options.maxInternalLoops, 4);
+  const evidenceFile = options.evidenceFile ?? "evidence.json";
+  const stateDir = join(projectDir, AUTONOMOUS_STATE_DIR);
+  const runsDir = join(stateDir, "runs");
+  const latestPath = join(stateDir, "latest.json");
+  const requiredFiles = autonomousRequiredFiles({ command, requiredFiles: options.requiredFiles });
+
+  if (parseMaybeBoolean(options.validateOnly) === true) {
+    const validation = validateAutonomousProject({
+      projectDir,
+      command,
+      evidenceFile,
+      minTests,
+      requiredFiles,
+      verifyTimeoutMs: options.verifyTimeoutMs
+    });
+    const result = { mode: "autonomous-validate", status: validation.status, projectDir, validation };
+    writeJson(latestPath, result);
+    return result;
+  }
+
+  const taskText = readAutonomousTaskText(options);
+  ensureAutonomousProjectDir(projectDir, parseMaybeBoolean(options.allowExisting) === true);
+  mkdirSync(runsDir, { recursive: true });
+  writeFileSync(join(stateDir, "task.original.md"), taskText, "utf8");
+
+  const prompt = autonomousPrompt({
+    taskText,
+    projectDir,
+    commandText,
+    minTests,
+    evidenceFile,
+    maxInternalLoops
+  });
+  writeFileSync(join(stateDir, "task.md"), prompt, "utf8");
+
+  const attempts = [];
+  const initialRunDir = join(runsDir, `${timestampId()}-initial`);
+  if (parseMaybeBoolean(options.dryRun) === true) {
+    mkdirSync(initialRunDir, { recursive: true });
+    const promptPath = join(initialRunDir, "prompt.md");
+    writeFileSync(promptPath, prompt, "utf8");
+    const result = {
+      mode: "autonomous-dry-run",
+      status: "prepared",
+      projectDir,
+      promptPath,
+      requiredFiles,
+      verificationCommand: commandText
+    };
+    writeJson(latestPath, result);
+    return result;
+  }
+
+  attempts.push(runAutonomousPiAttempt({ options, projectDir, runDir: initialRunDir, prompt }));
+
+  let validation = validateAutonomousProject({
+    projectDir,
+    command,
+    evidenceFile,
+    minTests,
+    requiredFiles,
+    verifyTimeoutMs: options.verifyTimeoutMs
+  });
+
+  for (let index = 0; validation.status !== "passed" && index < repairAttempts; index += 1) {
+    const repairRunDir = join(runsDir, `${timestampId()}-repair-${index + 1}`);
+    const repairPrompt = autonomousRepairPrompt({
+      validation,
+      commandText,
+      minTests,
+      evidenceFile,
+      maxInternalLoops
+    });
+    attempts.push(runAutonomousPiAttempt({ options, projectDir, runDir: repairRunDir, prompt: repairPrompt }));
+    validation = validateAutonomousProject({
+      projectDir,
+      command,
+      evidenceFile,
+      minTests,
+      requiredFiles,
+      verifyTimeoutMs: options.verifyTimeoutMs
+    });
+  }
+
+  const result = {
+    mode: "autonomous-run",
+    status: validation.status,
+    projectDir,
+    model: options.model ?? DEFAULT_IMPLEMENTATION_MODEL,
+    verificationCommand: commandText,
+    requiredFiles,
+    attempts,
+    validation
+  };
+  writeJson(latestPath, result);
+  return result;
+}
+
+export function validateAutonomousProject(options = {}) {
+  const projectDir = resolve(options.projectDir ?? options.project ?? options.cwd ?? process.cwd());
+  const command = normalizeCommand(options.command ?? options.verificationCommand);
+  const verificationCommand = command.length ? command : ["npm", "test"];
+  const commandText = verificationCommand.join(" ");
+  const evidenceFile = options.evidenceFile ?? "evidence.json";
+  const minTests = nonNegativeInteger(options.minTests, 1);
+  const requiredFiles = autonomousRequiredFiles({ command: verificationCommand, requiredFiles: options.requiredFiles });
+  const verifyTimeoutMs = positiveNumber(options.verifyTimeoutMs, DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_MS);
+  const failures = [];
+  const warnings = [];
+  const evidencePath = join(projectDir, evidenceFile);
+
+  for (const file of requiredFiles) {
+    if (!existsSync(join(projectDir, file))) failures.push(`required file missing: ${file}`);
+  }
+
+  const evidence = readJson(evidencePath);
+  if (!evidence) {
+    failures.push(`evidence file missing or invalid: ${evidenceFile}`);
+  } else {
+    if (evidence.status !== "passed") failures.push(`evidence.status is not passed: ${JSON.stringify(evidence.status)}`);
+    if (evidence.testCommand !== commandText) failures.push(`evidence.testCommand mismatch: ${JSON.stringify(evidence.testCommand)} !== ${JSON.stringify(commandText)}`);
+    const tests = evidence.tests ?? {};
+    if (!Number.isFinite(Number(tests.total)) || Number(tests.total) < minTests) failures.push(`evidence tests.total is below ${minTests}: ${JSON.stringify(tests.total)}`);
+    if (Number.isFinite(Number(tests.fail)) && Number(tests.fail) !== 0) failures.push(`evidence tests.fail is not 0: ${tests.fail}`);
+    failures.push(...validateAutonomousChangedFiles(evidence, projectDir));
+  }
+
+  let verification = null;
+  if (failures.length === 0 && parseMaybeBoolean(options.runVerification) !== false) {
+    const validationDir = join(projectDir, AUTONOMOUS_STATE_DIR, "validation");
+    mkdirSync(validationDir, { recursive: true });
+    const stdoutPath = join(validationDir, "verification.stdout.log");
+    const stderrPath = join(validationDir, "verification.stderr.log");
+    const result = runVerificationCommand({
+      command: verificationCommand,
+      cwd: projectDir,
+      timeoutMs: verifyTimeoutMs,
+      stdoutPath,
+      stderrPath
+    });
+    const parsedTests = parseAutonomousTestCounts(`${result.stdout}\n${result.stderr}`);
+    verification = {
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      stdoutPath,
+      stderrPath,
+      parsedTests
+    };
+    if (result.timedOut) failures.push(`verification command timed out after ${verifyTimeoutMs}ms`);
+    if (result.exitCode !== 0) failures.push(`verification command exited ${result.exitCode}`);
+    if (parsedTests.total === 0) failures.push("verification command reported zero tests");
+    else if (Number.isFinite(parsedTests.total) && parsedTests.total < minTests) failures.push(`verification command reported only ${parsedTests.total} tests`);
+    else if (parsedTests.total === null) warnings.push("could not parse test count from verification output; using evidence tests count");
+    if (Number.isFinite(parsedTests.fail) && parsedTests.fail !== 0) failures.push(`verification command reported ${parsedTests.fail} failed tests`);
+  }
+
+  return {
+    status: failures.length === 0 ? "passed" : "failed",
+    projectDir,
+    evidencePath,
+    failures,
+    warnings,
+    evidence,
+    verification
+  };
 }
 
 export function checkLlamaSwapProvider(options = {}) {
@@ -1931,7 +2112,7 @@ function isStatePath(path, cwd) {
 }
 
 function isHarnessWorkerCommand(command) {
-  return /(?:^|\s)(?:qwen-harness-codex|node\s+\S*qwen-harness-codex\.mjs)\s+(?:worker|hybrid-run|hybrid-resume|hybrid-status|verify-package|create-correction|final-gate|recover-worker|local-review)\b/.test(command)
+  return /(?:^|\s)(?:qwen-harness-codex|node\s+\S*qwen-harness-codex\.mjs)\s+(?:worker|hybrid-run|hybrid-resume|hybrid-status|verify-package|create-correction|final-gate|recover-worker|local-review|autonomous-run|autonomous-lite|autonomous-validate|validate-autonomous)\b/.test(command)
     || /(?:^|\s)pi\s+.*--no-session\s+.*--model\s+(?:local-qwen|llama-local)\//.test(command);
 }
 
@@ -2033,6 +2214,239 @@ function parseMaybeBoolean(value) {
 function positiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function nonNegativeInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+}
+
+function timestampId() {
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+function readAutonomousTaskText(options = {}) {
+  const taskFile = stringValue(options.taskFile).trim();
+  if (taskFile) return readFileSync(resolve(taskFile), "utf8");
+  const task = requiredString(options.task, "task");
+  const maybePath = resolve(task);
+  if (existsSync(maybePath) && !lstatSync(maybePath).isDirectory()) return readFileSync(maybePath, "utf8");
+  return task;
+}
+
+function ensureAutonomousProjectDir(projectDir, allowExisting) {
+  mkdirSync(projectDir, { recursive: true });
+  const entries = safeReadDir(projectDir).filter((name) => name !== AUTONOMOUS_STATE_DIR);
+  if (!allowExisting && entries.length > 0) {
+    throw new Error(`Project directory is not empty: ${projectDir}. Use --allow-existing to reuse it.`);
+  }
+}
+
+function autonomousRequiredFiles({ command, requiredFiles }) {
+  const required = Array.isArray(requiredFiles)
+    ? requiredFiles.map(String).filter(Boolean)
+    : normalizeCommand(requiredFiles);
+  if (command[0] === "npm" && !required.includes("package.json")) required.push("package.json");
+  return required;
+}
+
+function autonomousPrompt({ taskText, projectDir, commandText, minTests, evidenceFile, maxInternalLoops }) {
+  return `# Qwen Autonomous Lite Contract
+
+You are the implementation worker. Codex will not read your full logs or write corrections.
+You must complete the implementation, test loop, and compact evidence by yourself.
+
+## Working directory boundary
+
+- Your current working directory is the project root:
+  ${projectDir}
+- Create and edit files only inside this directory.
+- Do not create files in the benchmark/spec directory.
+- Do not create or modify files outside the current working directory.
+- Use relative paths in evidence.
+
+## Required execution loop
+
+1. Inspect the current project directory.
+2. Implement the requested project.
+3. Run this verification command exactly:
+
+\`\`\`sh
+${commandText}
+\`\`\`
+
+4. If verification fails, or if the test count is less than ${minTests}, fix the code and rerun.
+5. Repeat internally up to ${maxInternalLoops} test/fix loops.
+6. Run the verification command one final time.
+
+## Required evidence
+
+Write compact final evidence to \`${evidenceFile}\` at the project root.
+The evidence must be valid JSON with this shape:
+
+\`\`\`json
+{
+  "status": "passed",
+  "summary": "one concise paragraph",
+  "testCommand": "${commandText}",
+  "tests": { "pass": 0, "fail": 0, "total": 0 },
+  "changedFiles": ["relative/path"],
+  "commands": [{ "command": "${commandText}", "exitCode": 0 }],
+  "risks": ["remaining risk, or none"]
+}
+\`\`\`
+
+Rules:
+- Set \`status\` to \`"passed"\` only when the final verification command exits 0 and test total is at least ${minTests}.
+- Set \`status\` to \`"failed"\` if you cannot complete the work.
+- Keep evidence short. Do not paste source files or long logs.
+- Do not ask Codex for intermediate review.
+
+## Task
+
+${taskText.trim()}
+`;
+}
+
+function autonomousRepairPrompt({ validation, commandText, minTests, evidenceFile, maxInternalLoops }) {
+  return `# Qwen Autonomous Lite Repair
+
+You are repairing your own implementation inside the current project directory.
+Codex is only providing the compact validation result below and will not read full logs.
+
+## Validation failure
+
+\`\`\`json
+${JSON.stringify(validation, null, 2)}
+\`\`\`
+
+## Repair requirements
+
+- Edit only files inside the current project directory.
+- Fix the specific validation failures.
+- Run \`${commandText}\`.
+- If it fails, repair and rerun up to ${maxInternalLoops} loops.
+- Update \`${evidenceFile}\` with compact valid JSON.
+- \`status\` may be \`"passed"\` only if final verification exits 0 and test total is at least ${minTests}.
+- Do not paste source files or long logs in the console.
+`;
+}
+
+function runAutonomousPiAttempt({ options, projectDir, runDir, prompt }) {
+  mkdirSync(runDir, { recursive: true });
+  const promptPath = join(runDir, "prompt.md");
+  const stdoutPath = join(runDir, "pi.stdout.jsonl");
+  const stderrPath = join(runDir, "pi.stderr.log");
+  writeFileSync(promptPath, prompt, "utf8");
+
+  const piBinary = options.piBinary ?? "pi";
+  const model = options.model ?? DEFAULT_IMPLEMENTATION_MODEL;
+  const args = [
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--model",
+    model,
+    `@${relative(projectDir, promptPath)}`
+  ];
+  const stdoutFd = openSync(stdoutPath, "w");
+  const stderrFd = openSync(stderrPath, "w");
+  try {
+    const result = spawnSync(piBinary, args, {
+      cwd: projectDir,
+      stdio: ["ignore", stdoutFd, stderrFd],
+      timeout: positiveNumber(options.timeoutMs, DEFAULT_AUTONOMOUS_TIMEOUT_MS),
+      maxBuffer: Number(options.maxBuffer ?? DEFAULT_PI_MAX_BUFFER)
+    });
+    return {
+      exitCode: result.status ?? (result.error ? 1 : 0),
+      signal: result.signal ?? null,
+      timedOut: result.error?.code === "ETIMEDOUT",
+      model,
+      promptPath,
+      stdoutPath,
+      stderrPath
+    };
+  } finally {
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+  }
+}
+
+function runVerificationCommand({ command, cwd, timeoutMs, stdoutPath, stderrPath }) {
+  mkdirSync(dirname(stdoutPath), { recursive: true });
+  const result = spawnSync(command[0], command.slice(1), {
+    cwd,
+    encoding: "utf8",
+    shell: false,
+    timeout: timeoutMs,
+    maxBuffer: DEFAULT_LOG_MAX_BYTES
+  });
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? result.error?.message ?? "";
+  writeFileSync(stdoutPath, compactLog(stdout, DEFAULT_LOG_MAX_BYTES), "utf8");
+  writeFileSync(stderrPath, compactLog(stderr, DEFAULT_LOG_MAX_BYTES), "utf8");
+  return {
+    exitCode: result.status ?? (result.error ? 1 : 0),
+    signal: result.signal ?? null,
+    timedOut: result.error?.code === "ETIMEDOUT",
+    stdout,
+    stderr
+  };
+}
+
+function parseAutonomousTestCounts(output) {
+  const lastNumberFor = (label) => {
+    const matches = [...String(output).matchAll(new RegExp(`^(?:#|ℹ)\\s*${label}\\s+(\\d+)\\s*$`, "gim"))];
+    if (!matches.length) return null;
+    return Number(matches[matches.length - 1][1]);
+  };
+  const tapTests = lastNumberFor("tests");
+  const tapPass = lastNumberFor("pass");
+  const tapFail = lastNumberFor("fail");
+  if (tapTests !== null || tapPass !== null || tapFail !== null) {
+    return {
+      total: tapTests ?? (tapPass ?? 0) + (tapFail ?? 0),
+      pass: tapPass,
+      fail: tapFail,
+      source: "node-test-summary"
+    };
+  }
+  const jestLike = String(output).match(/Tests:\s+(?:(\d+)\s+failed,\s+)?(?:(\d+)\s+passed,\s+)?(\d+)\s+total/i);
+  if (jestLike) {
+    return {
+      fail: Number(jestLike[1] || 0),
+      pass: Number(jestLike[2] || 0),
+      total: Number(jestLike[3]),
+      source: "jest-summary"
+    };
+  }
+  const vitestLike = String(output).match(/Test Files\s+\d+\s+passed.*?Tests\s+(\d+)\s+passed/is);
+  if (vitestLike) {
+    const pass = Number(vitestLike[1]);
+    return { total: pass, pass, fail: 0, source: "vitest-summary" };
+  }
+  return { total: null, pass: null, fail: null, source: "unknown" };
+}
+
+function validateAutonomousChangedFiles(evidence, projectDir) {
+  const failures = [];
+  if (!Array.isArray(evidence.changedFiles)) return ["evidence.changedFiles must be an array"];
+  for (const changedFile of evidence.changedFiles) {
+    if (typeof changedFile !== "string" || !changedFile.trim()) {
+      failures.push(`changedFiles contains invalid entry: ${JSON.stringify(changedFile)}`);
+      continue;
+    }
+    if (isAbsolute(changedFile)) {
+      const rel = relative(projectDir, resolve(changedFile));
+      if (rel.startsWith("..") || isAbsolute(rel)) failures.push(`changed file is outside project directory: ${changedFile}`);
+      continue;
+    }
+    const normalized = relative(".", changedFile);
+    if (normalized.startsWith("..") || isAbsolute(normalized)) failures.push(`relative changed file escapes project directory: ${changedFile}`);
+  }
+  return failures;
 }
 
 function providerUrlFromOptions(options = {}) {
@@ -2538,7 +2952,9 @@ function parseArgs(argv) {
     if (arg === "--live") opts.live = true;
     else if (arg === "--force") opts.force = true;
     else if (arg === "--cwd") opts.cwd = argv[++index];
+    else if (arg === "--project") opts.project = argv[++index];
     else if (arg === "--task") opts.task = argv[++index];
+    else if (arg === "--task-file") opts.taskFile = argv[++index];
     else if (arg === "--task-id") opts.taskId = argv[++index];
     else if (arg === "--run-id") opts.runId = argv[++index];
     else if (arg === "--title") opts.title = argv[++index];
@@ -2559,11 +2975,23 @@ function parseArgs(argv) {
     else if (arg === "--goal-achieved") opts.goalAchieved = argv[++index];
     else if (arg === "--kind") opts.kind = argv[++index];
     else if (arg === "--timeout-ms") opts.timeoutMs = argv[++index];
+    else if (arg === "--verify-timeout-ms") opts.verifyTimeoutMs = argv[++index];
     else if (arg === "--provider-timeout-ms") opts.providerTimeoutMs = argv[++index];
     else if (arg === "--max-age-ms") opts.maxAgeMs = argv[++index];
     else if (arg === "--status") opts.status = argv[++index];
     else if (arg === "--max-buffer") opts.maxBuffer = argv[++index];
     else if (arg === "--max-log-bytes") opts.maxLogBytes = argv[++index];
+    else if (arg === "--min-tests") opts.minTests = argv[++index];
+    else if (arg === "--repair-attempts") opts.repairAttempts = argv[++index];
+    else if (arg === "--max-internal-loops") opts.maxInternalLoops = argv[++index];
+    else if (arg === "--evidence-file") opts.evidenceFile = argv[++index];
+    else if (arg === "--require-file") {
+      opts.requiredFiles ??= [];
+      opts.requiredFiles.push(argv[++index]);
+    }
+    else if (arg === "--allow-existing") opts.allowExisting = true;
+    else if (arg === "--dry-run") opts.dryRun = true;
+    else if (arg === "--validate-only") opts.validateOnly = true;
     else if (arg === "--pi-binary") opts.piBinary = argv[++index];
     else if (arg === "--curl-binary") opts.curlBinary = argv[++index];
     else if (arg === "--provider-url") opts.providerUrl = argv[++index];
@@ -2618,6 +3046,14 @@ async function main(argv = process.argv.slice(2)) {
     case "benchmark-summary":
       print(summarizeEvaluation(opts));
       break;
+    case "autonomous-run":
+    case "autonomous-lite":
+      print(runAutonomous(opts));
+      break;
+    case "autonomous-validate":
+    case "validate-autonomous":
+      print(runAutonomous({ ...opts, validateOnly: true }));
+      break;
     case "verify-package":
       print(verifyPackage(opts));
       break;
@@ -2634,7 +3070,7 @@ async function main(argv = process.argv.slice(2)) {
     case "help":
     case "--help":
     case "-h":
-      console.log("qwen-harness-codex hybrid-run|hybrid-status|worker|recover-worker|local-review|model-health|evaluation-report|verify-package|create-correction|final-gate|codex-native-hook");
+      console.log("qwen-harness-codex hybrid-run|hybrid-status|worker|recover-worker|local-review|model-health|evaluation-report|autonomous-run|autonomous-validate|verify-package|create-correction|final-gate|codex-native-hook");
       break;
     default:
       throw new Error(`unknown command: ${command}`);

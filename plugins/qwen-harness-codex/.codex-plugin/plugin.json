@@ -1,7 +1,7 @@
 {
   "name": "qwen-harness-codex",
-  "version": "0.1.0+codex.20260527143033",
-  "description": "Codex-native hybrid harness with Pi/local Qwen worker transport.",
+  "version": "0.1.0+codex.20260528073759",
+  "description": "Codex-native Qwen harness with heavy hybrid and autonomous-lite local worker modes.",
   "author": {
     "name": "Julirsia"
   },
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Qwen Harness Codex",
-    "shortDescription": "Codex designs and verifies; Pi launches local Qwen workers.",
-    "longDescription": "Adds a Codex-native hybrid-run workflow with durable .qwen-harness state, hook-based write guards, Pi-launched local Qwen worker handoffs, package verification, correction packages, and a final proof gate.",
+    "shortDescription": "Run heavy hybrid or autonomous-lite Qwen worker flows.",
+    "longDescription": "Adds Codex-native Qwen harness workflows: a heavy hybrid-run with durable .qwen-harness state, package verification, correction packages, and final proof gate; plus autonomous-lite mode where local Qwen implements, tests, and repairs while Codex validates compact evidence only.",
     "developerName": "Julirsia",
     "category": "Developer Tools",
     "capabilities": [
@@ -27,6 +27,7 @@
     ],
     "defaultPrompt": [
       "Start a qwen-first hybrid run for this repo",
+      "Run autonomous-lite Qwen implementation for this project",
       "Show the current qwen harness status",
       "Create a correction package for failed evidence"
     ]

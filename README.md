@@ -2,10 +2,10 @@
 
 Local Codex plugin marketplace for `qwen-harness-codex`.
 
-Current stable plugin version: `0.1.0+codex.20260527143033`.
+Current stable plugin version: `0.1.0+codex.20260528073759`.
 
 This marketplace intentionally publishes the MCP-compatible stable bundle with
-8 qwen harness tools. Run the verification script before pushing changes so a
+9 qwen harness tools. Run the verification script before pushing changes so a
 broken bundle does not become the latest install target.
 
 ## Install
@@ -38,6 +38,12 @@ Model switching is allowed by default so the role's intended model is used. Use
 
 ```bash
 node scripts/verify-qwen-harness-marketplace.mjs
+
+node plugins/qwen-harness-codex/scripts/qwen-harness-codex.mjs autonomous-run \
+  --project /tmp/qwen-autonomous-demo \
+  --task "Build a tiny Node project with npm test and compact evidence." \
+  --dry-run \
+  --verification-command npm test
 
 node plugins/qwen-harness-codex/scripts/qwen-harness-codex.mjs model-health \
   --provider-url http://127.0.0.1:8080 \
