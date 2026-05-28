@@ -1,7 +1,7 @@
 {
   "name": "qwen-harness-codex",
-  "version": "0.1.0+codex.20260528074840",
-  "description": "Codex-native Qwen harness with heavy hybrid and autonomous-lite local worker modes.",
+  "version": "0.1.0+codex.20260528110853",
+  "description": "Codex-native Qwen harness with detached autonomous-lite token-saving and heavy assurance modes.",
   "author": {
     "name": "Julirsia"
   },
@@ -19,8 +19,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Qwen Harness Codex",
-    "shortDescription": "Run heavy hybrid or autonomous-lite Qwen worker flows.",
-    "longDescription": "Adds Codex-native Qwen harness workflows: a heavy hybrid-run with durable .qwen-harness state, package verification, correction packages, and final proof gate; plus autonomous-lite mode where local Qwen implements, tests, and repairs while Codex validates compact evidence only.",
+    "shortDescription": "Run detached autonomous-lite or heavy assurance Qwen flows.",
+    "longDescription": "Adds Codex-native Qwen harness workflows: autonomous-lite mode where local Qwen implements, tests, repairs, and reports compact evidence while Codex polls and validates; plus a heavy assurance hybrid-run with durable .qwen-harness state, package verification, correction packages, and final proof gate.",
     "developerName": "Julirsia",
     "category": "Developer Tools",
     "capabilities": [

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {
+  autonomousJobStatus,
   checkLlamaSwapProvider,
   createCorrectionPackage,
   initHybridRun,
@@ -83,10 +84,23 @@ const tools = [
       maxInternalLoops: { type: "number" },
       evidenceFile: { type: "string" },
       allowExisting: { type: "boolean" },
+      detached: { type: "boolean" },
+      background: { type: "boolean" },
       dryRun: { type: "boolean" },
       validateOnly: { type: "boolean" },
       timeoutMs: { type: "number" },
-      verifyTimeoutMs: { type: "number" }
+      verifyTimeoutMs: { type: "number" },
+      watchdogIntervalMs: { type: "number" },
+      jobId: { type: "string" }
+    })
+  },
+  {
+    name: "codex_harness_autonomous_job_status",
+    description: "Check a detached autonomous-lite job and return compact latest validation/evidence state.",
+    inputSchema: objectSchema({
+      project: { type: "string" },
+      cwd: { type: "string" },
+      jobId: { type: "string" }
     })
   },
   {
@@ -113,7 +127,8 @@ const handlers = {
   codex_harness_model_health: checkLlamaSwapProvider,
   codex_harness_verify_package: verifyPackage,
   codex_harness_evaluation_report: summarizeEvaluation,
-  codex_harness_autonomous_run: runAutonomous,
+  codex_harness_autonomous_run: (args) => runAutonomous({ ...args, detached: args.detached ?? true }),
+  codex_harness_autonomous_job_status: autonomousJobStatus,
   codex_harness_create_correction: createCorrectionPackage,
   codex_harness_final_gate: runFinalGate
 };
@@ -179,15 +194,16 @@ function handleMessageText(text) {
       const args = message.params?.arguments ?? {};
       const handler = handlers[name];
       if (!handler) throw new Error(`unknown tool: ${name}`);
-      const result = handler(args);
-      respond(message.id, {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2)
-          }
-        ]
-      });
+      Promise.resolve(handler(args))
+        .then((result) => respond(message.id, {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        }))
+        .catch((error) => writeJsonRpc({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: error.message } }));
       return;
     }
     respond(message.id, {});

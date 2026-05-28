@@ -27,10 +27,13 @@ Autonomous-lite is the token-saving mode.
 5. Codex validates `evidence.json` and the configured verification command.
 
 Codex must not read `.qwen-autonomous/runs/*/pi.stdout.jsonl` during benchmark measurement.
+For MCP usage, run autonomous-lite as a detached job and poll compact status. The runner has a watchdog that terminates Pi after evidence plus verification pass, and token usage is parsed from the JSONL file instead of full stdout.
 
 ## Preferred Invocation
 
 Use the MCP tool `codex_harness_autonomous_run` when available.
+
+Pass `detached: true` unless the user explicitly asks to block until completion. Then poll `codex_harness_autonomous_job_status`.
 
 CLI fallback:
 
@@ -38,6 +41,7 @@ CLI fallback:
 qwen-harness-codex autonomous-run \
   --project PROJECT_PATH \
   --task-file TASK_FILE \
+  --detached \
   --min-tests 20 \
   --verification-command npm test
 ```
@@ -48,8 +52,15 @@ For inline task text:
 qwen-harness-codex autonomous-run \
   --project PROJECT_PATH \
   --task "TASK_TEXT" \
+  --detached \
   --min-tests 20 \
   --verification-command npm test
+```
+
+Poll:
+
+```bash
+qwen-harness-codex autonomous-status --project PROJECT_PATH
 ```
 
 ## Validation
@@ -63,7 +74,7 @@ qwen-harness-codex autonomous-validate \
   --verification-command npm test
 ```
 
-Reject missing evidence, zero tests, failed verification, parent-package npm walkups, and files escaping the project directory.
+Reject missing evidence, zero tests, failed verification, parent-package npm walkups, and files escaping the project directory. Normalize compact status aliases first: `pass`, `passed`, `success`, `ok`, `complete`, and `completed` count as passed.
 
 ## Output
 

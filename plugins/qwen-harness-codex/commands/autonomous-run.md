@@ -21,6 +21,7 @@ Use this command when the user wants maximum Codex token savings and says things
 - `verification_command`: default `npm test`.
 - `min_tests`: default `1`; ask or choose a sensible threshold for benchmark work.
 - `model`: optional local model override.
+- `detached`: default `true` for MCP usage; prevents Codex/MCP timeout while Qwen works.
 
 ## Preflight
 
@@ -38,6 +39,8 @@ State that this will use autonomous-lite:
 - Local Qwen runs inside the target project cwd.
 - Qwen implements, tests, and repairs internally.
 - Codex validates only `evidence.json` and the verification command.
+- A watchdog stops the Pi worker once compact evidence and verification pass.
+- Pi JSONL token usage is parsed from the log file without loading the full log into Codex context.
 
 ## Commands
 
@@ -55,8 +58,15 @@ Use parameters equivalent to:
   "task": "TASK_TEXT",
   "taskFile": "TASK_FILE",
   "verificationCommand": ["npm", "test"],
-  "minTests": 20
+  "minTests": 20,
+  "detached": true
 }
+```
+
+Then poll:
+
+```text
+codex_harness_autonomous_job_status
 ```
 
 If MCP is not available, use CLI fallback:
@@ -65,6 +75,7 @@ If MCP is not available, use CLI fallback:
 qwen-harness-codex autonomous-run \
   --project PROJECT_PATH \
   --task-file TASK_FILE \
+  --detached \
   --min-tests 20 \
   --verification-command npm test
 ```
@@ -75,8 +86,15 @@ For an inline task:
 qwen-harness-codex autonomous-run \
   --project PROJECT_PATH \
   --task "TASK_TEXT" \
+  --detached \
   --min-tests 20 \
   --verification-command npm test
+```
+
+Poll a detached CLI job:
+
+```bash
+qwen-harness-codex autonomous-status --project PROJECT_PATH
 ```
 
 ## Verification
@@ -98,7 +116,7 @@ qwen-harness-codex autonomous-validate \
 
 3. Reject:
    - missing `evidence.json`
-   - `status` not `passed`
+   - normalized `status` not `passed`; aliases like `pass`, `success`, and `ok` are accepted as passed
    - zero tests
    - failed verification command
    - changed files outside target project

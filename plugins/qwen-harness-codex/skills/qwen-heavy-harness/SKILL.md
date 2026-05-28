@@ -5,7 +5,7 @@ description: Use when the user explicitly asks for heavy harness, 헤비 하네�
 
 # Qwen Heavy Harness
 
-Use this skill when the user wants the original Codex-owned heavy hybrid harness.
+Use this skill when the user wants the original Codex-owned heavy hybrid harness. Treat it as assurance-oriented, not as the main Codex token-saving mode.
 
 Trigger phrases include:
 
@@ -30,6 +30,7 @@ Heavy harness is the assurance-oriented mode.
 8. Codex runs final gate.
 
 Codex must not directly mutate product source/test/config during an active `.qwen-harness` run.
+The runner writes Pi JSONL to disk, parses token usage from the file, and normalizes compact worker evidence aliases. If `acceptanceEvidence` is missing, raw source/runtime/adversarial/reentry fields can be converted into acceptance claims, but source plus runtime proof are still required.
 
 ## Preferred Invocation
 
@@ -62,7 +63,7 @@ Create correction packages only when verification fails.
 
 ## Validation
 
-Do not accept smoke-only evidence. Prefer source evidence, runtime evidence, adversarial probes, reentry/idempotency probes, and residual risk notes.
+Do not accept smoke-only evidence. Require source evidence, runtime evidence, adversarial probes, reentry/idempotency probes, and residual risk notes where applicable.
 
 ## Output
 

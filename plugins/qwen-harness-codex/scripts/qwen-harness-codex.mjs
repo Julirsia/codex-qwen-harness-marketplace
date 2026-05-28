@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  readSync,
   readFileSync,
   writeFileSync
 } from "node:fs";
@@ -31,6 +32,8 @@ const DEFAULT_PI_MAX_BUFFER = 256 * 1024 * 1024;
 const DEFAULT_LOG_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_AUTONOMOUS_TIMEOUT_MS = 45 * 60 * 1000;
 const DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_WATCHDOG_INTERVAL_MS = 15000;
+const DEFAULT_CHILD_SHUTDOWN_GRACE_MS = 5000;
 const DEFAULT_PROVIDER_TIMEOUT_MS = 120000;
 const DEFAULT_PROVIDER_STATUS_TIMEOUT_MS = 5000;
 
@@ -282,7 +285,7 @@ export function createCorrectionPackage(options = {}) {
   return { ok: true, correctionId, targetPackageId, path: filePath };
 }
 
-export function spawnWorker(options = {}) {
+export async function spawnWorker(options = {}) {
   const startedAtMs = Date.now();
   const cwd = resolve(options.cwd ?? process.cwd());
   const paths = nativeHybridPaths({ cwd });
@@ -389,20 +392,29 @@ export function spawnWorker(options = {}) {
   let workerStatus = "prepared";
   let stdout = "";
   let stderr = "";
+  let workerProcess = null;
+  const stdoutRawPath = join(runDir, "stdout.jsonl");
+  const stderrRawPath = join(runDir, "stderr.raw.log");
+  const stdoutLogPath = join(runDir, "stdout.log");
+  const stderrLogPath = join(runDir, "stderr.log");
   if (options.live) {
-    const result = spawnSync(piBinary, piCommand.args, {
+    const timeoutMs = Number(options.timeoutMs ?? 600000);
+    workerProcess = await runPiProcessToFiles({
+      command: piBinary,
+      args: piCommand.args,
       cwd,
-      encoding: "utf8",
-      shell: false,
-      timeout: Number(options.timeoutMs ?? 600000),
-      maxBuffer: Number(options.maxBuffer ?? DEFAULT_PI_MAX_BUFFER)
+      stdoutPath: stdoutRawPath,
+      stderrPath: stderrRawPath,
+      timeoutMs,
+      watchdogIntervalMs: positiveNumber(options.watchdogIntervalMs, DEFAULT_WATCHDOG_INTERVAL_MS),
+      watchdog: async () => workerEvidenceReadyForWatchdog(evidencePath)
     });
-    stdout = result.stdout ?? "";
-    stderr = result.stderr ?? "";
-    exitCode = result.status ?? (result.error ? 1 : 0);
-    workerStatus = exitCode === 0 ? "completed" : "failed";
-    writeFileSync(join(runDir, "stdout.log"), compactLog(stdout, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES)), "utf8");
-    writeFileSync(join(runDir, "stderr.log"), compactLog(stderr || result.error?.message || "", Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES)), "utf8");
+    stdout = readCompactFile(stdoutRawPath, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES));
+    stderr = readCompactFile(stderrRawPath, Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES));
+    exitCode = workerProcess.exitCode ?? (workerProcess.errorMessage ? 1 : 0);
+    workerStatus = exitCode === 0 || workerProcess.watchdogTerminated ? "completed" : "failed";
+    writeFileSync(stdoutLogPath, stdout, "utf8");
+    writeFileSync(stderrLogPath, compactLog(stderr || workerProcess.errorMessage || "", Number(options.maxLogBytes ?? DEFAULT_LOG_MAX_BYTES)), "utf8");
   } else {
     workerStatus = "dry-run";
   }
@@ -413,10 +425,13 @@ export function spawnWorker(options = {}) {
     writeFileSync(verificationOutputPath, toolExecutions.map((execution) => execution.output).filter(Boolean).join("\n\n---\n\n"), "utf8");
   }
   const changedFiles = diffSnapshots(beforeSnapshot, snapshotWorkspace(cwd));
-  const parsedUsage = parsePiUsage(stdout);
+  const parsedFileUsage = parsePiUsageFile(stdoutRawPath);
+  const parsedUsage = tokenBucketHasValue(parsedFileUsage.local)
+    ? parsedFileUsage
+    : parsePiUsage(stdout);
   const synthesizedAcceptance = synthesizeAcceptanceEvidence({ changedFiles, toolExecutions, verificationCommand, runDir });
-  const existingEvidence = readJson(evidencePath);
-  const evidence = existingEvidence && typeof existingEvidence === "object" ? {
+  const existingEvidence = normalizeWorkerEvidence(readJson(evidencePath));
+  const evidenceDraft = existingEvidence && typeof existingEvidence === "object" ? {
     ...existingEvidence,
     workerRunId: existingEvidence.workerRunId ?? workerRunId,
     packageId: existingEvidence.packageId ?? packageId ?? null,
@@ -466,6 +481,14 @@ export function spawnWorker(options = {}) {
     residualRisks: [],
     tokenUsage: parsedUsage
   };
+  const evidence = normalizeWorkerEvidence(evidenceDraft, {
+    workerRunId,
+    packageId: packageId ?? null,
+    correctionId: correctionId ?? null,
+    fallbackStatus: synthesizedAcceptance.length > 0 && changedFiles.length > 0 ? "completed" : workerStatus,
+    filesChanged: changedFiles,
+    parsedUsage
+  });
   writeJson(evidencePath, evidence);
   writeFileSync(join(runDir, "worker-summary.md"), workerSummary(evidence), "utf8");
   writeJson(join(runDir, "changed-files.json"), changedFiles);
@@ -480,7 +503,8 @@ export function spawnWorker(options = {}) {
     tokenUsage: evidence.tokenUsage,
     filesChanged: changedFiles,
     exitCode,
-    providerPreflight
+    providerPreflight,
+    watchdogTerminated: workerProcess?.watchdogTerminated ?? false
   }));
   clearActiveWorker({ cwd, workerRunId, status: evidence.status ?? workerStatus });
   appendEvent(paths.events, { type: "worker_run_recorded", at: new Date().toISOString(), workerRunId, status: workerStatus });
@@ -488,8 +512,14 @@ export function spawnWorker(options = {}) {
   return { ok: evidence.status !== "failed", status: evidence.status, workerRunId, runDir, evidencePath };
 }
 
-export function runAutonomous(options = {}) {
+export async function runAutonomous(options = {}) {
   const projectDir = resolve(options.project ?? options.cwd ?? process.cwd());
+  const wantsDetached = parseMaybeBoolean(options.detached ?? options.background ?? options.async) === true
+    && parseMaybeBoolean(options.validateOnly) !== true
+    && parseMaybeBoolean(options.dryRun) !== true;
+  if (wantsDetached) {
+    return runAutonomousDetached({ ...options, project: projectDir });
+  }
   const verificationCommand = normalizeCommand(options.verificationCommand);
   const command = verificationCommand.length ? verificationCommand : ["npm", "test"];
   const commandText = command.join(" ");
@@ -513,6 +543,7 @@ export function runAutonomous(options = {}) {
     });
     const result = { mode: "autonomous-validate", status: validation.status, projectDir, validation };
     writeJson(latestPath, result);
+    updateAutonomousJobFromEnv(result);
     return result;
   }
 
@@ -546,10 +577,11 @@ export function runAutonomous(options = {}) {
       verificationCommand: commandText
     };
     writeJson(latestPath, result);
+    updateAutonomousJobFromEnv(result);
     return result;
   }
 
-  attempts.push(runAutonomousPiAttempt({ options, projectDir, runDir: initialRunDir, prompt }));
+  attempts.push(await runAutonomousPiAttempt({ options, projectDir, runDir: initialRunDir, prompt, command, evidenceFile, minTests, requiredFiles }));
 
   let validation = validateAutonomousProject({
     projectDir,
@@ -569,7 +601,7 @@ export function runAutonomous(options = {}) {
       evidenceFile,
       maxInternalLoops
     });
-    attempts.push(runAutonomousPiAttempt({ options, projectDir, runDir: repairRunDir, prompt: repairPrompt }));
+    attempts.push(await runAutonomousPiAttempt({ options, projectDir, runDir: repairRunDir, prompt: repairPrompt, command, evidenceFile, minTests, requiredFiles }));
     validation = validateAutonomousProject({
       projectDir,
       command,
@@ -588,10 +620,160 @@ export function runAutonomous(options = {}) {
     verificationCommand: commandText,
     requiredFiles,
     attempts,
-    validation
+    validation,
+    tokenUsage: attempts.reduce((total, attempt) => mergeTokenUsage(total, attempt.tokenUsage), emptyTokenUsage())
   };
   writeJson(latestPath, result);
+  updateAutonomousJobFromEnv(result);
   return result;
+}
+
+export function autonomousJobStatus(options = {}) {
+  const projectDir = resolve(options.project ?? options.cwd ?? process.cwd());
+  const stateDir = join(projectDir, AUTONOMOUS_STATE_DIR);
+  const jobsDir = join(stateDir, "jobs");
+  const jobId = options.jobId ?? latestJobId(jobsDir);
+  if (!jobId) {
+    return { mode: "autonomous-job-status", status: "missing", projectDir, jobId: null, reason: "no autonomous jobs found" };
+  }
+  const jobPath = join(jobsDir, jobId, "job.json");
+  const job = readJson(jobPath) ?? {};
+  const latest = readJson(join(stateDir, "latest.json"));
+  const running = job.completedAt ? false : processIsRunning(job.pid);
+  const status = latest?.status && !running
+    ? latest.status
+    : running
+      ? "running"
+      : job.status === "running"
+        ? "exited"
+        : job.status ?? "unknown";
+  return {
+    mode: "autonomous-job-status",
+    status,
+    projectDir,
+    jobId,
+    pid: job.pid ?? null,
+    running,
+    startedAt: job.startedAt ?? null,
+    completedAt: job.completedAt ?? null,
+    stdoutPath: job.stdoutPath ?? null,
+    stderrPath: job.stderrPath ?? null,
+    latestPath: existsSync(join(stateDir, "latest.json")) ? join(stateDir, "latest.json") : null,
+    latest
+  };
+}
+
+function runAutonomousDetached(options = {}) {
+  const projectDir = resolve(options.project ?? options.cwd ?? process.cwd());
+  const stateDir = join(projectDir, AUTONOMOUS_STATE_DIR);
+  const jobsDir = join(stateDir, "jobs");
+  const jobId = options.jobId ?? timestampId();
+  const jobDir = join(jobsDir, jobId);
+  mkdirSync(jobDir, { recursive: true });
+  const jobTaskPath = join(jobDir, "task.md");
+  const stdoutPath = join(jobDir, "job.stdout.log");
+  const stderrPath = join(jobDir, "job.stderr.log");
+  writeFileSync(jobTaskPath, readAutonomousTaskText(options), "utf8");
+  const jobPath = join(jobDir, "job.json");
+  const args = [
+    fileURLToPath(import.meta.url),
+    "autonomous-run",
+    "--project",
+    projectDir,
+    "--task-file",
+    jobTaskPath,
+    "--min-tests",
+    String(nonNegativeInteger(options.minTests, 1)),
+    "--repair-attempts",
+    String(nonNegativeInteger(options.repairAttempts, 1)),
+    "--max-internal-loops",
+    String(nonNegativeInteger(options.maxInternalLoops, 4)),
+    "--evidence-file",
+    options.evidenceFile ?? "evidence.json",
+    "--timeout-ms",
+    String(positiveNumber(options.timeoutMs, DEFAULT_AUTONOMOUS_TIMEOUT_MS)),
+    "--verify-timeout-ms",
+    String(positiveNumber(options.verifyTimeoutMs, DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_MS))
+  ];
+  const model = options.model ?? DEFAULT_IMPLEMENTATION_MODEL;
+  if (model) args.push("--model", model);
+  if (options.piBinary) args.push("--pi-binary", options.piBinary);
+  if (options.watchdogIntervalMs) args.push("--watchdog-interval-ms", String(options.watchdogIntervalMs));
+  if (parseMaybeBoolean(options.allowExisting) === true) args.push("--allow-existing");
+  for (const file of Array.isArray(options.requiredFiles) ? options.requiredFiles : []) args.push("--require-file", String(file));
+  const verificationCommand = normalizeCommand(options.verificationCommand);
+  if (verificationCommand.length) args.push("--verification-command", ...verificationCommand);
+  const stdoutFd = openSync(stdoutPath, "w");
+  const stderrFd = openSync(stderrPath, "w");
+  const child = spawn(process.execPath, args, {
+    cwd: projectDir,
+    detached: true,
+    stdio: ["ignore", stdoutFd, stderrFd],
+    env: {
+      ...process.env,
+      QWEN_HARNESS_JOB_PATH: jobPath
+    }
+  });
+  closeSync(stdoutFd);
+  closeSync(stderrFd);
+  child.unref();
+  const job = {
+    version: 1,
+    mode: "autonomous-run-detached",
+    status: "running",
+    jobId,
+    pid: child.pid,
+    projectDir,
+    startedAt: new Date().toISOString(),
+    stdoutPath,
+    stderrPath,
+    command: [process.execPath, ...args],
+    model,
+    verificationCommand: verificationCommand.length ? verificationCommand.join(" ") : "npm test"
+  };
+  writeJson(jobPath, job);
+  return {
+    mode: "autonomous-run-detached",
+    status: "running",
+    projectDir,
+    jobId,
+    pid: child.pid,
+    jobPath,
+    stdoutPath,
+    stderrPath,
+    statusCommand: `qwen-harness-codex autonomous-status --project ${JSON.stringify(projectDir)} --job-id ${JSON.stringify(jobId)}`
+  };
+}
+
+function latestJobId(jobsDir) {
+  if (!existsSync(jobsDir)) return null;
+  return safeReadDir(jobsDir)
+    .filter((name) => existsSync(join(jobsDir, name, "job.json")))
+    .sort()
+    .at(-1) ?? null;
+}
+
+function processIsRunning(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isFinite(numericPid) || numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function updateAutonomousJobFromEnv(result) {
+  const jobPath = process.env.QWEN_HARNESS_JOB_PATH;
+  if (!jobPath) return;
+  const existing = readJson(jobPath) ?? {};
+  writeJson(jobPath, {
+    ...existing,
+    status: result?.status ?? "unknown",
+    completedAt: new Date().toISOString(),
+    result
+  });
 }
 
 export function validateAutonomousProject(options = {}) {
@@ -611,7 +793,7 @@ export function validateAutonomousProject(options = {}) {
     if (!existsSync(join(projectDir, file))) failures.push(`required file missing: ${file}`);
   }
 
-  const evidence = readJson(evidencePath);
+  const evidence = normalizeAutonomousEvidence(readJson(evidencePath), { commandText });
   if (!evidence) {
     failures.push(`evidence file missing or invalid: ${evidenceFile}`);
   } else {
@@ -775,9 +957,10 @@ export function verifyPackage(options = {}) {
   ensureActiveHarness(paths);
   const packageId = requiredString(options.packageId ?? options.package, "package");
   mkdirSync(paths.verificationDir, { recursive: true });
-  const latestEvidence = findLatestEvidence(paths.workerRunsDir, packageId);
+  const latestEvidence = normalizeWorkerEvidence(findLatestEvidence(paths.workerRunsDir, packageId));
   const claims = buildClaimsFromEvidence(latestEvidence);
-  const passed = latestEvidence && latestEvidence.status === "completed" && claims.every((claim) => claim.verdict === "pass");
+  const evidenceStatus = normalizeWorkerEvidenceStatus(latestEvidence?.status, latestEvidence?.status);
+  const passed = latestEvidence && evidenceStatus === "completed" && claims.every((claim) => claim.verdict === "pass");
   const verdict = passed ? "PASS" : "REQUEST_CHANGES";
   const result = {
     version: 1,
@@ -820,8 +1003,8 @@ export function recoverActiveWorker(options = {}) {
   const preSnapshot = objectToSnapshot(readJson(join(runDir, "pre-snapshot.json")));
   const changedFiles = preSnapshot ? diffSnapshots(preSnapshot, snapshotWorkspace(cwd)) : readJson(join(runDir, "changed-files.json")) ?? [];
   const inferredStatus = normalizeWorkerEvidenceStatus(options.status, inferRecoveredStatus(runDir));
-  const existingEvidence = readJson(evidencePath);
-  const evidence = existingEvidence && typeof existingEvidence === "object" ? {
+  const existingEvidence = normalizeWorkerEvidence(readJson(evidencePath));
+  const evidenceDraft = existingEvidence && typeof existingEvidence === "object" ? {
     ...existingEvidence,
     status: normalizeWorkerEvidenceStatus(options.status, existingEvidence.status ?? inferredStatus),
     filesChanged: mergeUnique(existingEvidence.filesChanged, changedFiles),
@@ -845,6 +1028,13 @@ export function recoverActiveWorker(options = {}) {
     residualRisks: inferredStatus === "completed" ? ["Evidence was recovered after launcher interruption; rerun if stronger evidence is needed."] : [],
     tokenUsage: emptyTokenUsage()
   };
+  const evidence = normalizeWorkerEvidence(evidenceDraft, {
+    workerRunId: active.workerRunId,
+    packageId: active.packageId ?? null,
+    correctionId: active.correctionId ?? null,
+    fallbackStatus: inferredStatus,
+    filesChanged: Array.isArray(changedFiles) ? changedFiles : []
+  });
   writeJson(evidencePath, evidence);
   writeJson(join(runDir, "changed-files.json"), Array.isArray(changedFiles) ? changedFiles : []);
   writeFileSync(join(runDir, "worker-summary.md"), workerSummary(evidence), "utf8");
@@ -1590,7 +1780,8 @@ function buildClaimsFromEvidence(evidence) {
       residualGap: "Worker evidence missing."
     }];
   }
-  const acceptance = normalizeAcceptanceEvidence(evidence.acceptanceEvidence);
+  const normalizedEvidence = normalizeWorkerEvidence(evidence);
+  const acceptance = normalizeAcceptanceEvidence(normalizedEvidence.acceptanceEvidence);
   if (acceptance.length > 0) {
     return acceptance.map((item, index) => ({
       claim: `${item.acceptanceId ?? `AC${index + 1}`} is satisfied`,
@@ -1601,18 +1792,19 @@ function buildClaimsFromEvidence(evidence) {
       residualGap: (item.residualGaps ?? []).join("; ")
     }));
   }
-  const commands = Array.isArray(evidence.commandsRun) ? evidence.commandsRun : [];
+  const commands = Array.isArray(normalizedEvidence.commandsRun) ? normalizedEvidence.commandsRun : [];
   const commandPassed = commands.some((command) => command.exitCode === 0);
-  const changedFiles = Array.isArray(evidence.filesChanged) ? evidence.filesChanged : [];
-  const residualRisks = Array.isArray(evidence.residualRisks) ? evidence.residualRisks : [];
+  const changedFiles = Array.isArray(normalizedEvidence.filesChanged) ? normalizedEvidence.filesChanged : [];
+  const residualRisks = Array.isArray(normalizedEvidence.residualRisks) ? normalizedEvidence.residualRisks : [];
+  const completed = normalizeWorkerEvidenceStatus(normalizedEvidence.status, normalizedEvidence.status) === "completed";
   return [
     {
       claim: "Worker completed package run",
-      verdict: evidence.status === "completed" && commandPassed ? "pass" : "unknown",
+      verdict: completed && commandPassed ? "pass" : "unknown",
       evidence: commands,
       evidenceType: commandPassed ? "runtime" : "static",
       whatWouldFailIfBroken: "Worker command exits non-zero or reports blockers.",
-      residualGap: evidence.status === "completed" && commandPassed ? "" : "No completed runtime evidence."
+      residualGap: completed && commandPassed ? "" : "No completed runtime evidence."
     },
     {
       claim: "Changed product files are recorded",
@@ -1659,7 +1851,7 @@ function findLatestEvidence(workerRunsDir, packageId) {
   const names = safeReadDir(workerRunsDir).filter((name) => name.includes(packageId)).sort();
   for (const name of names.reverse()) {
     const evidence = readJson(join(workerRunsDir, name, "evidence.json"));
-    if (evidence) return evidence;
+    if (evidence) return normalizeWorkerEvidence(evidence);
   }
   return null;
 }
@@ -1762,6 +1954,7 @@ function collectWorkerEvidence(workerRunsDir) {
   if (!existsSync(workerRunsDir)) return [];
   return safeReadDir(workerRunsDir)
     .map((name) => readJson(join(workerRunsDir, name, "evidence.json")))
+    .map((value) => normalizeWorkerEvidence(value))
     .filter((value) => value && typeof value === "object");
 }
 
@@ -1803,20 +1996,21 @@ function mergeMetricAndEvidenceRuns({ metrics, evidenceRuns, localReviews }) {
 }
 
 function metricFromEvidence(evidence) {
+  const normalized = normalizeWorkerEvidence(evidence);
   return {
     version: 1,
-    at: evidence.completedAt ?? null,
-    workerRunId: evidence.workerRunId,
-    kind: evidence.phase === "scout_worker" ? "scout" : evidence.phase === "correction_worker" ? "correction" : "package",
-    role: evidence.phase === "scout_worker" ? "scout" : evidence.phase === "correction_worker" ? "correction" : "implementation",
-    model: evidence.model,
-    status: evidence.status,
-    durationMs: durationBetween(evidence.startedAt, evidence.completedAt),
-    tokenUsage: evidence.tokenUsage ?? emptyTokenUsage(),
-    filesChanged: evidence.filesChanged ?? evidence.files_changed ?? [],
-    filesChangedCount: Array.isArray(evidence.filesChanged) ? evidence.filesChanged.length : Array.isArray(evidence.files_changed) ? evidence.files_changed.length : 0,
-    exitCode: Array.isArray(evidence.commandsRun) ? evidence.commandsRun.find((command) => command.exitCode !== undefined)?.exitCode ?? null : null,
-    providerPreflight: evidence.providerPreflight ?? null
+    at: normalized.completedAt ?? null,
+    workerRunId: normalized.workerRunId,
+    kind: normalized.phase === "scout_worker" ? "scout" : normalized.phase === "correction_worker" ? "correction" : "package",
+    role: normalized.phase === "scout_worker" ? "scout" : normalized.phase === "correction_worker" ? "correction" : "implementation",
+    model: normalized.model,
+    status: normalized.status,
+    durationMs: durationBetween(normalized.startedAt, normalized.completedAt),
+    tokenUsage: normalized.tokenUsage ?? emptyTokenUsage(),
+    filesChanged: normalized.filesChanged ?? [],
+    filesChangedCount: Array.isArray(normalized.filesChanged) ? normalized.filesChanged.length : 0,
+    exitCode: Array.isArray(normalized.commandsRun) ? normalized.commandsRun.find((command) => command.exitCode !== undefined)?.exitCode ?? null : null,
+    providerPreflight: normalized.providerPreflight ?? null
   };
 }
 
@@ -2332,7 +2526,7 @@ ${JSON.stringify(validation, null, 2)}
 `;
 }
 
-function runAutonomousPiAttempt({ options, projectDir, runDir, prompt }) {
+async function runAutonomousPiAttempt({ options, projectDir, runDir, prompt, command, evidenceFile, minTests, requiredFiles }) {
   mkdirSync(runDir, { recursive: true });
   const promptPath = join(runDir, "prompt.md");
   const stdoutPath = join(runDir, "pi.stdout.jsonl");
@@ -2350,28 +2544,40 @@ function runAutonomousPiAttempt({ options, projectDir, runDir, prompt }) {
     model,
     `@${relative(projectDir, promptPath)}`
   ];
-  const stdoutFd = openSync(stdoutPath, "w");
-  const stderrFd = openSync(stderrPath, "w");
-  try {
-    const result = spawnSync(piBinary, args, {
-      cwd: projectDir,
-      stdio: ["ignore", stdoutFd, stderrFd],
-      timeout: positiveNumber(options.timeoutMs, DEFAULT_AUTONOMOUS_TIMEOUT_MS),
-      maxBuffer: Number(options.maxBuffer ?? DEFAULT_PI_MAX_BUFFER)
-    });
-    return {
-      exitCode: result.status ?? (result.error ? 1 : 0),
-      signal: result.signal ?? null,
-      timedOut: result.error?.code === "ETIMEDOUT",
-      model,
-      promptPath,
-      stdoutPath,
-      stderrPath
-    };
-  } finally {
-    closeSync(stdoutFd);
-    closeSync(stderrFd);
-  }
+  const result = await runPiProcessToFiles({
+    command: piBinary,
+    args,
+    cwd: projectDir,
+    stdoutPath,
+    stderrPath,
+    timeoutMs: positiveNumber(options.timeoutMs, DEFAULT_AUTONOMOUS_TIMEOUT_MS),
+    watchdogIntervalMs: positiveNumber(options.watchdogIntervalMs, DEFAULT_WATCHDOG_INTERVAL_MS),
+    watchdog: async () => {
+      const validation = validateAutonomousProject({
+        projectDir,
+        command,
+        evidenceFile,
+        minTests,
+        requiredFiles,
+        verifyTimeoutMs: options.verifyTimeoutMs
+      });
+      return validation.status === "passed"
+        ? { ready: true, reason: "autonomous evidence passed verification", validation }
+        : { ready: false };
+    }
+  });
+  return {
+    exitCode: result.exitCode ?? (result.errorMessage ? 1 : 0),
+    signal: result.signal ?? null,
+    timedOut: result.timedOut,
+    watchdogTerminated: result.watchdogTerminated,
+    watchdogReason: result.watchdogReason,
+    model,
+    promptPath,
+    stdoutPath,
+    stderrPath,
+    tokenUsage: parsePiUsageFile(stdoutPath)
+  };
 }
 
 function runVerificationCommand({ command, cwd, timeoutMs, stdoutPath, stderrPath }) {
@@ -2394,6 +2600,132 @@ function runVerificationCommand({ command, cwd, timeoutMs, stdoutPath, stderrPat
     stdout,
     stderr
   };
+}
+
+async function runPiProcessToFiles({
+  command,
+  args,
+  cwd,
+  stdoutPath,
+  stderrPath,
+  timeoutMs,
+  watchdog = null,
+  watchdogIntervalMs = DEFAULT_WATCHDOG_INTERVAL_MS
+}) {
+  mkdirSync(dirname(stdoutPath), { recursive: true });
+  mkdirSync(dirname(stderrPath), { recursive: true });
+  const stdoutFd = openSync(stdoutPath, "w");
+  const stderrFd = openSync(stderrPath, "w");
+  const startedAtMs = Date.now();
+  let child;
+  let settled = false;
+  let exitCode = null;
+  let signal = null;
+  let errorMessage = null;
+  let timedOut = false;
+  let watchdogTerminated = false;
+  let watchdogReason = null;
+
+  const finishPromise = new Promise((resolveFinish) => {
+    try {
+      child = spawn(command, args, {
+        cwd,
+        stdio: ["ignore", stdoutFd, stderrFd],
+        shell: false
+      });
+    } catch (error) {
+      settled = true;
+      exitCode = 1;
+      errorMessage = error.message;
+      resolveFinish();
+      return;
+    }
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      exitCode = 1;
+      errorMessage = error.message;
+      resolveFinish();
+    });
+    child.on("exit", (code, childSignal) => {
+      if (settled) return;
+      settled = true;
+      exitCode = code;
+      signal = childSignal;
+      resolveFinish();
+    });
+  });
+
+  try {
+    let nextWatchdogAt = Date.now() + Math.max(1000, Number(watchdogIntervalMs) || DEFAULT_WATCHDOG_INTERVAL_MS);
+    while (!settled) {
+      const now = Date.now();
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0 && now - startedAtMs >= timeoutMs) {
+        timedOut = true;
+        await terminateChild(child, finishPromise, "SIGTERM");
+        if (!settled) await terminateChild(child, finishPromise, "SIGKILL");
+        if (!settled) {
+          settled = true;
+          exitCode = 1;
+          signal = "SIGKILL";
+        }
+        break;
+      }
+
+      if (watchdog && now >= nextWatchdogAt) {
+        nextWatchdogAt = now + Math.max(1000, Number(watchdogIntervalMs) || DEFAULT_WATCHDOG_INTERVAL_MS);
+        let watchdogResult = null;
+        try {
+          watchdogResult = await watchdog({ pid: child?.pid ?? null, elapsedMs: now - startedAtMs });
+        } catch {
+          watchdogResult = null;
+        }
+        if (watchdogResult?.ready) {
+          watchdogTerminated = true;
+          watchdogReason = watchdogResult.reason ?? "watchdog condition satisfied";
+          await terminateChild(child, finishPromise, "SIGTERM");
+          if (!settled) await terminateChild(child, finishPromise, "SIGKILL");
+          if (!settled) {
+            settled = true;
+            exitCode = 0;
+            signal = "SIGKILL";
+          }
+          break;
+        }
+      }
+
+      await delay(Math.min(1000, Math.max(100, nextWatchdogAt - Date.now())));
+    }
+    if (!settled) await finishPromise;
+  } finally {
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+  }
+
+  return {
+    exitCode,
+    signal,
+    timedOut,
+    watchdogTerminated,
+    watchdogReason,
+    errorMessage,
+    pid: child?.pid ?? null,
+    durationMs: Math.max(0, Date.now() - startedAtMs)
+  };
+}
+
+async function terminateChild(child, finishPromise, signal) {
+  if (!child || child.exitCode !== null) return;
+  try {
+    child.kill(signal);
+  } catch {
+    return;
+  }
+  await Promise.race([finishPromise, delay(DEFAULT_CHILD_SHUTDOWN_GRACE_MS)]);
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
 function parseAutonomousTestCounts(output) {
@@ -2591,23 +2923,53 @@ function recoveredCommands(runDir) {
 function parsePiUsage(stdout) {
   const usage = emptyTokenUsage();
   for (const line of String(stdout ?? "").split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const messageUsage = event?.message?.usage ?? event?.usage ?? event?.assistantMessageEvent?.partial?.usage;
-    if (!messageUsage || typeof messageUsage !== "object") continue;
-    const input = numberValue(messageUsage.input ?? messageUsage.inputTokens);
-    const output = numberValue(messageUsage.output ?? messageUsage.outputTokens);
-    const total = numberValue(messageUsage.totalTokens ?? messageUsage.total ?? input + output);
-    usage.local.input = Math.max(usage.local.input, input);
-    usage.local.output = Math.max(usage.local.output, output);
-    usage.local.total = Math.max(usage.local.total, total);
+    parsePiUsageLine(line, usage);
   }
   return usage;
+}
+
+function parsePiUsageFile(path) {
+  const usage = emptyTokenUsage();
+  if (!path || !existsSync(path)) return usage;
+  const fd = openSync(path, "r");
+  const buffer = Buffer.alloc(64 * 1024);
+  let carry = "";
+  try {
+    while (true) {
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead <= 0) break;
+      const chunk = `${carry}${buffer.subarray(0, bytesRead).toString("utf8")}`;
+      const lines = chunk.split(/\r?\n/);
+      carry = lines.pop() ?? "";
+      for (const line of lines) parsePiUsageLine(line, usage);
+    }
+    if (carry.trim()) parsePiUsageLine(carry, usage);
+  } finally {
+    closeSync(fd);
+  }
+  return usage;
+}
+
+function parsePiUsageLine(line, usage) {
+  if (!String(line ?? "").trim()) return;
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const messageUsage = event?.message?.usage
+    ?? event?.usage
+    ?? event?.assistantMessageEvent?.partial?.usage
+    ?? event?.response?.usage
+    ?? event?.data?.usage;
+  if (!messageUsage || typeof messageUsage !== "object") return;
+  const input = numberValue(messageUsage.input ?? messageUsage.inputTokens ?? messageUsage.prompt_tokens ?? messageUsage.promptTokens);
+  const output = numberValue(messageUsage.output ?? messageUsage.outputTokens ?? messageUsage.completion_tokens ?? messageUsage.completionTokens);
+  const total = numberValue(messageUsage.totalTokens ?? messageUsage.total ?? messageUsage.total_tokens ?? input + output);
+  usage.local.input = Math.max(usage.local.input, input);
+  usage.local.output = Math.max(usage.local.output, output);
+  usage.local.total = Math.max(usage.local.total, total);
 }
 
 function extractFinalAssistantText(stdout) {
@@ -2707,10 +3069,128 @@ function inferReviewVerdict(text) {
 }
 
 function normalizeWorkerEvidenceStatus(status, fallback) {
-  if (["completed", "blocked", "failed", "dry-run"].includes(status)) return status;
-  if (status === "passed") return "completed";
-  if (status === "complete") return "completed";
+  const text = String(status ?? "").trim().toLowerCase();
+  if (["completed", "blocked", "failed", "dry-run"].includes(text)) return text;
+  if (["passed", "pass", "success", "ok", "done", "complete"].includes(text)) return "completed";
+  if (["fail", "error", "errored"].includes(text)) return "failed";
   return fallback;
+}
+
+function normalizeWorkerEvidence(evidence, context = {}) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return evidence;
+  const normalizedCommands = Array.isArray(evidence.commandsRun) && evidence.commandsRun.length
+    ? evidence.commandsRun
+    : Array.isArray(evidence.commands) && evidence.commands.length
+      ? evidence.commands.map((command) => ({
+          command: command.command ?? command.cmd ?? String(command),
+          exitCode: command.exitCode ?? command.code ?? null,
+          outputPath: command.outputPath ?? command.logPath ?? null,
+          summary: command.summary ?? undefined
+        }))
+      : evidence.commandsRun;
+  const filesChanged = mergeUnique(
+    evidence.filesChanged,
+    evidence.changedFiles,
+    evidence.files_changed,
+    context.filesChanged
+  );
+  const acceptance = normalizeAcceptanceEvidence(evidence.acceptanceEvidence);
+  const rawAcceptance = acceptance.length ? acceptance : acceptanceEvidenceFromRawEvidence({
+    ...evidence,
+    filesChanged,
+    commandsRun: normalizedCommands
+  });
+  const tokenUsage = context.parsedUsage
+    ? preferMeasuredTokenUsage(evidence.tokenUsage, context.parsedUsage)
+    : evidence.tokenUsage ?? emptyTokenUsage();
+  return {
+    ...evidence,
+    workerRunId: evidence.workerRunId ?? context.workerRunId ?? null,
+    packageId: evidence.packageId ?? evidence.package ?? context.packageId ?? null,
+    correctionId: evidence.correctionId ?? context.correctionId ?? null,
+    status: normalizeWorkerEvidenceStatus(evidence.status, context.fallbackStatus ?? evidence.status),
+    filesChanged,
+    commandsRun: normalizedCommands ?? [],
+    acceptanceEvidence: rawAcceptance,
+    tokenUsage
+  };
+}
+
+function acceptanceEvidenceFromRawEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object") return [];
+  const sourceEvidence = normalizeEvidenceList(evidence.sourceEvidence ?? evidence.source_evidence ?? evidence.filesChanged ?? evidence.changedFiles);
+  const runtimeEvidence = normalizeEvidenceList(
+    evidence.runtimeEvidence
+      ?? evidence.runtime_evidence
+      ?? evidence.testOutputPath
+      ?? evidence.testOutput
+      ?? evidence.commandsRun
+      ?? evidence.commands
+  );
+  const adversarialProbes = normalizeEvidenceList(evidence.adversarialProbe ?? evidence.adversarialProbes ?? evidence.adversarial_probe);
+  const reentryProbes = normalizeEvidenceList(
+    evidence.reentryIdempotencyProbe
+      ?? evidence.reentryIdempotencyProbes
+      ?? evidence.reentryProbe
+      ?? evidence.reentryProbes
+      ?? evidence.idempotencyProbe
+  );
+  const residualGaps = normalizeEvidenceList(evidence.residualGaps ?? evidence.residualRisks ?? evidence.risks);
+  const commands = Array.isArray(evidence.commandsRun) ? evidence.commandsRun : [];
+  const commandPassed = commands.some((command) => Number(command?.exitCode) === 0);
+  const status = normalizeWorkerEvidenceStatus(evidence.status, evidence.status);
+  const hasSourceAndRuntime = sourceEvidence.length > 0 && (runtimeEvidence.length > 0 || commandPassed);
+  if (!sourceEvidence.length && !runtimeEvidence.length && !adversarialProbes.length && !reentryProbes.length && !commandPassed) return [];
+  return [{
+    acceptanceId: "AC1",
+    status: status === "completed" && hasSourceAndRuntime ? "claimed_passed" : "failed",
+    sourceEvidence,
+    runtimeEvidence,
+    adversarialProbes,
+    reentryProbes,
+    residualGaps
+  }];
+}
+
+function normalizeAutonomousEvidence(evidence, { commandText } = {}) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return evidence;
+  const commands = Array.isArray(evidence.commands) ? evidence.commands : Array.isArray(evidence.commandsRun) ? evidence.commandsRun : [];
+  const firstCommand = commands.find((command) => command?.command !== undefined)?.command;
+  const commandFromEvidence = evidence.testCommand
+    ?? (Array.isArray(firstCommand) ? firstCommand.join(" ") : typeof firstCommand === "string" ? firstCommand : null)
+    ?? evidence.command
+    ?? null;
+  return {
+    ...evidence,
+    status: normalizeAutonomousStatus(evidence.status),
+    testCommand: commandFromEvidence,
+    tests: evidence.tests ?? evidence.testResults ?? evidence.testSummary ?? {},
+    changedFiles: Array.isArray(evidence.changedFiles)
+      ? evidence.changedFiles
+      : Array.isArray(evidence.filesChanged)
+        ? evidence.filesChanged
+        : []
+  };
+}
+
+function normalizeAutonomousStatus(status) {
+  const text = String(status ?? "").trim().toLowerCase();
+  if (["passed", "pass", "success", "ok", "completed", "complete", "done"].includes(text)) return "passed";
+  if (["failed", "fail", "error", "blocked"].includes(text)) return "failed";
+  return text || status;
+}
+
+function workerEvidenceReadyForWatchdog(evidencePath) {
+  const evidence = normalizeWorkerEvidence(readJson(evidencePath));
+  if (!evidence) return { ready: false };
+  if (normalizeWorkerEvidenceStatus(evidence.status, evidence.status) !== "completed") return { ready: false };
+  const commands = Array.isArray(evidence.commandsRun) ? evidence.commandsRun : [];
+  const commandPassed = commands.some((command) => Number(command?.exitCode) === 0);
+  const acceptance = normalizeAcceptanceEvidence(evidence.acceptanceEvidence);
+  const acceptancePassed = acceptance.length > 0 && acceptance.every((item) => item.status === "claimed_passed");
+  return commandPassed || acceptancePassed
+    ? { ready: true, reason: "worker evidence completed with passing command or acceptance evidence" }
+    : { ready: false };
 }
 
 function normalizeCommandsRun(commandsRun, { piBinary, piCommand, exitCode, runDir, options, toolExecutions = [] }) {
@@ -2799,6 +3279,29 @@ function normalizeEvidenceList(value) {
   return [];
 }
 
+function readCompactFile(path, maxBytes = DEFAULT_LOG_MAX_BYTES) {
+  if (!path || !existsSync(path)) return "";
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_LOG_MAX_BYTES;
+  const stat = lstatSync(path);
+  if (!stat.isFile()) return "";
+  if (stat.size <= limit) return readFileSync(path, "utf8");
+  const half = Math.floor(limit / 2);
+  const fd = openSync(path, "r");
+  try {
+    const head = Buffer.alloc(half);
+    const tail = Buffer.alloc(half);
+    const headBytes = readSync(fd, head, 0, half, 0);
+    const tailBytes = readSync(fd, tail, 0, half, Math.max(0, stat.size - half));
+    return [
+      head.subarray(0, headBytes).toString("utf8"),
+      `\n\n[log compacted by qwen-harness-codex: originalBytes=${stat.size}, retainedBytes~=${limit}]\n\n`,
+      tail.subarray(0, tailBytes).toString("utf8")
+    ].join("");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function compactLog(value, maxBytes) {
   const text = String(value ?? "");
   const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_LOG_MAX_BYTES;
@@ -2854,7 +3357,7 @@ function updateAggregateTokenUsage({ cwd, usage }) {
   }
 }
 
-function runMetric({ workerRunId, kind, role, model, status, startedAtMs, tokenUsage, filesChanged, exitCode, providerPreflight = null }) {
+function runMetric({ workerRunId, kind, role, model, status, startedAtMs, tokenUsage, filesChanged, exitCode, providerPreflight = null, watchdogTerminated = false }) {
   const endedAtMs = Date.now();
   return {
     version: 1,
@@ -2869,6 +3372,7 @@ function runMetric({ workerRunId, kind, role, model, status, startedAtMs, tokenU
     filesChanged: Array.isArray(filesChanged) ? filesChanged : [],
     filesChangedCount: Array.isArray(filesChanged) ? filesChanged.length : 0,
     exitCode,
+    watchdogTerminated,
     providerPreflight: providerPreflight ? {
       ok: providerPreflight.ok,
       targetModel: providerPreflight.targetModel,
@@ -2978,6 +3482,7 @@ function parseArgs(argv) {
     else if (arg === "--verify-timeout-ms") opts.verifyTimeoutMs = argv[++index];
     else if (arg === "--provider-timeout-ms") opts.providerTimeoutMs = argv[++index];
     else if (arg === "--max-age-ms") opts.maxAgeMs = argv[++index];
+    else if (arg === "--watchdog-interval-ms") opts.watchdogIntervalMs = argv[++index];
     else if (arg === "--status") opts.status = argv[++index];
     else if (arg === "--max-buffer") opts.maxBuffer = argv[++index];
     else if (arg === "--max-log-bytes") opts.maxLogBytes = argv[++index];
@@ -2985,11 +3490,14 @@ function parseArgs(argv) {
     else if (arg === "--repair-attempts") opts.repairAttempts = argv[++index];
     else if (arg === "--max-internal-loops") opts.maxInternalLoops = argv[++index];
     else if (arg === "--evidence-file") opts.evidenceFile = argv[++index];
+    else if (arg === "--job-id") opts.jobId = argv[++index];
     else if (arg === "--require-file") {
       opts.requiredFiles ??= [];
       opts.requiredFiles.push(argv[++index]);
     }
     else if (arg === "--allow-existing") opts.allowExisting = true;
+    else if (arg === "--detached") opts.detached = true;
+    else if (arg === "--background") opts.background = true;
     else if (arg === "--dry-run") opts.dryRun = true;
     else if (arg === "--validate-only") opts.validateOnly = true;
     else if (arg === "--pi-binary") opts.piBinary = argv[++index];
@@ -3027,7 +3535,7 @@ async function main(argv = process.argv.slice(2)) {
       break;
     case "worker":
     case "spawn-worker":
-      print(spawnWorker(opts));
+      print(await spawnWorker(opts));
       break;
     case "recover-worker":
     case "recover-active-worker":
@@ -3048,11 +3556,15 @@ async function main(argv = process.argv.slice(2)) {
       break;
     case "autonomous-run":
     case "autonomous-lite":
-      print(runAutonomous(opts));
+      print(await runAutonomous(opts));
+      break;
+    case "autonomous-status":
+    case "autonomous-job-status":
+      print(autonomousJobStatus(opts));
       break;
     case "autonomous-validate":
     case "validate-autonomous":
-      print(runAutonomous({ ...opts, validateOnly: true }));
+      print(await runAutonomous({ ...opts, validateOnly: true }));
       break;
     case "verify-package":
       print(verifyPackage(opts));
@@ -3070,7 +3582,7 @@ async function main(argv = process.argv.slice(2)) {
     case "help":
     case "--help":
     case "-h":
-      console.log("qwen-harness-codex hybrid-run|hybrid-status|worker|recover-worker|local-review|model-health|evaluation-report|autonomous-run|autonomous-validate|verify-package|create-correction|final-gate|codex-native-hook");
+      console.log("qwen-harness-codex hybrid-run|hybrid-status|worker|recover-worker|local-review|model-health|evaluation-report|autonomous-run|autonomous-status|autonomous-validate|verify-package|create-correction|final-gate|codex-native-hook");
       break;
     default:
       throw new Error(`unknown command: ${command}`);
@@ -3079,6 +3591,7 @@ async function main(argv = process.argv.slice(2)) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(fileURLToPath(import.meta.url)).href && process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
+    updateAutonomousJobFromEnv({ status: "failed", error: error.message });
     console.error(`qwen-harness-codex: ${error.message}`);
     process.exit(1);
   });

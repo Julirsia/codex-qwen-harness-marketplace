@@ -9,8 +9,8 @@ Use this skill when the user asks for `hybrid-run`, `qwen-first`, `autonomous-ru
 
 For explicit mode selection, prefer the narrower skills:
 
-- `qwen-autonomous-lite` for autonomous-run / Codex-judges-only mode.
-- `qwen-heavy-harness` for heavy hybrid-run / final-gate mode.
+- `qwen-autonomous-lite` for autonomous-run / Codex-judges-only / token-saving mode.
+- `qwen-heavy-harness` for heavy hybrid-run / final-gate / assurance mode.
 
 The plugin also exposes slash commands:
 
@@ -50,6 +50,7 @@ Use this mode when the priority is Codex token reduction and the task can be exp
 4. Qwen implements, runs tests, repairs internally, and writes compact `evidence.json`.
 5. Codex validates only `evidence.json` plus the configured verification command output.
 6. If validation fails, Qwen receives a compact validation summary for repair; Codex does not read full worker logs.
+7. In MCP usage, run detached and poll compact job status so Codex does not wait on or ingest long worker output.
 
 ## Hard Rules
 
@@ -61,6 +62,8 @@ Use this mode when the priority is Codex token reduction and the task can be exp
 - Do not accept worker self-report without source evidence, runtime evidence, adversarial probes, reentry probes where needed, and residual gap notes.
 - Do not directly edit product source/test/config during an active hybrid-run.
 - In autonomous-lite mode, do not read or summarize `.qwen-autonomous/runs/*/pi.stdout.jsonl`; use compact evidence and verification logs only.
+- Prefer detached autonomous jobs and watchdog termination once compact evidence plus verification pass.
+- Parse local model token usage from Pi JSONL files; do not buffer full stdout into Codex context.
 - Reject zero-test success and parent-package npm walkups.
 
 ## Commands
@@ -76,8 +79,12 @@ qwen-harness-codex final-gate
 qwen-harness-codex autonomous-run \
   --project projects/p15-example \
   --task-file benchmarks/p15-task.md \
+  --detached \
   --min-tests 20 \
   --verification-command npm test
+
+qwen-harness-codex autonomous-status \
+  --project projects/p15-example
 
 qwen-harness-codex autonomous-validate \
   --project projects/p15-example \

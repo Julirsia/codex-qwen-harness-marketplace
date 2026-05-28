@@ -4,7 +4,7 @@ description: Run the heavy Qwen hybrid harness where Codex designs/verifies and 
 
 # Qwen Heavy Harness
 
-Run the requested implementation through the original heavy hybrid harness.
+Run the requested implementation through the original heavy hybrid harness. This is the assurance mode, not the primary Codex token-saving path.
 
 Use this command when the user wants stronger orchestration, design gates, package verification, correction packages, or final proof gate, and says things like:
 
@@ -38,6 +38,8 @@ State that this will use heavy hybrid mode:
 - Qwen performs scout and package implementation.
 - Codex owns requirements, design, package verification, correction packages, and final gate.
 - Evidence must include source/runtime/adversarial/reentry claims; smoke-only evidence is not enough.
+- Worker JSONL is written to disk and token usage is parsed from the stream/file rather than buffered as full stdout.
+- Worker evidence aliases such as `pass`, `passed`, `success`, and `ok` are normalized to completed.
 
 ## Commands
 
@@ -81,6 +83,8 @@ Accept the run only when:
 4. evidence is behavioral and not smoke-only,
 5. residual risks are explicitly noted.
 
+Evidence may be compact raw JSON. If `acceptanceEvidence` is absent, source/runtime/adversarial/reentry fields are normalized into acceptance claims, but source plus runtime proof are still required for approval.
+
 ## Summary
 
 Report:
@@ -95,4 +99,4 @@ Report:
 
 ## Next Steps
 
-If Codex fresh-token efficiency is the priority and the heavy harness feels too expensive, recommend `/autonomous-run` for the next comparable benchmark.
+If Codex fresh-token efficiency is the priority, use `/autonomous-run`. Keep `/heavy-harness` for riskier work where assurance is worth extra Codex orchestration.
