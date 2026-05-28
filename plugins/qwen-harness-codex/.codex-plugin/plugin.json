@@ -1,6 +1,6 @@
 {
   "name": "qwen-harness-codex",
-  "version": "0.1.0+codex.20260528073759",
+  "version": "0.1.0+codex.20260528074840",
   "description": "Codex-native Qwen harness with heavy hybrid and autonomous-lite local worker modes.",
   "author": {
     "name": "Julirsia"
@@ -11,7 +11,9 @@
     "qwen",
     "pi",
     "hybrid-harness",
-    "native-hooks"
+    "native-hooks",
+    "autonomous-lite",
+    "slash-commands"
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
@@ -26,10 +28,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Start a qwen-first hybrid run for this repo",
-      "Run autonomous-lite Qwen implementation for this project",
-      "Show the current qwen harness status",
-      "Create a correction package for failed evidence"
+      "Run autonomous-lite Qwen implementation",
+      "Start heavy Qwen harness with final gate",
+      "Show the current qwen harness status"
     ]
   }
 }

@@ -7,6 +7,16 @@ description: Use when the user wants a Codex-native Qwen harness run, including 
 
 Use this skill when the user asks for `hybrid-run`, `qwen-first`, `autonomous-run`, `autonomous-lite`, local Qwen implementation, token-saving delegation, or Pi/Qwen-backed implementation.
 
+For explicit mode selection, prefer the narrower skills:
+
+- `qwen-autonomous-lite` for autonomous-run / Codex-judges-only mode.
+- `qwen-heavy-harness` for heavy hybrid-run / final-gate mode.
+
+The plugin also exposes slash commands:
+
+- `/autonomous-run`
+- `/heavy-harness`
+
 ## Ownership Model
 
 Codex native owns the parent hybrid-run state machine and all design/review/final gates.
